@@ -1,20 +1,20 @@
-import asyncio
 import logging
 import os
 import sys
+import time
 import threading
+import asyncio
 from datetime import datetime, timedelta
-from typing import Dict, List, Set, Optional
+from typing import Dict, List
 
 from flask import Flask
 from dotenv import load_dotenv
 import requests
-import aiohttp
 from cachetools import TTLCache
 
-# python-telegram-bot 13.x এর ইম্পোর্ট
+# Telegram Bot (stable version)
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
-from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler
 
 # লোড এনভায়রনমেন্ট
 load_dotenv()
@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # ক্যাশে
 cache = TTLCache(maxsize=1000, ttl=300)
 
-# ফ্লাস্ক অ্যাপ
+# ফ্লাস্ক অ্যাপ (হেলথ চেক)
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -50,40 +50,37 @@ def run_flask():
     """ফ্লাস্ক অ্যাপ চালু"""
     flask_app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
 
-# GitHub API ক্লায়েন্ট
-class GitHubAPIClient:
+# GitHub API ক্লায়েন্ট (সিঙ্ক্রোনাস)
+class GitHubClient:
     def __init__(self, token: str):
         self.token = token
-        self.headers = {
-            'Authorization': f'token {token}',
-            'Accept': 'application/vnd.github.v3+json'
-        }
+        self.headers = {'Authorization': f'token {token}'}
         self.base_url = 'https://api.github.com'
 
-    async def get_live_repos(self) -> List[Dict]:
-        """লাইভ রিপোজিটরি সংগ্রহ"""
+    def get_live_repos(self) -> List[Dict]:
+        """লাইভ রিপোজিটরি সংগ্রহ (সিঙ্ক্রোনাস)"""
         live_repos = []
         
         try:
-            async with aiohttp.ClientSession(headers=self.headers) as session:
-                urls = [
-                    f'{self.base_url}/search/repositories?q=stars:>1&sort=updated&order=desc&per_page=50',
-                    f'{self.base_url}/search/repositories?q=pushed:>{datetime.now() - timedelta(days=1)}&sort=updated&order=desc&per_page=50',
-                ]
+            # GitHub API কল
+            urls = [
+                f'{self.base_url}/search/repositories?q=stars:>1&sort=updated&order=desc&per_page=50',
+                f'{self.base_url}/search/repositories?q=pushed:>{datetime.now() - timedelta(days=1)}&sort=updated&order=desc&per_page=50',
+            ]
 
-                for url in urls:
-                    try:
-                        async with session.get(url) as response:
-                            if response.status == 200:
-                                data = await response.json()
-                                repos = data.get('items', [])
-                                for repo in repos:
-                                    if self._is_live_repo(repo):
-                                        live_repos.append(repo)
-                            await asyncio.sleep(0.3)
-                    except Exception as e:
-                        logger.error(f"Error fetching {url}: {e}")
-                        continue
+            for url in urls:
+                try:
+                    response = requests.get(url, headers=self.headers)
+                    if response.status_code == 200:
+                        data = response.json()
+                        repos = data.get('items', [])
+                        for repo in repos:
+                            if self._is_live(repo):
+                                live_repos.append(repo)
+                    time.sleep(0.3)  # Rate limit
+                except Exception as e:
+                    logger.error(f"Error fetching {url}: {e}")
+                    continue
 
             # ডুপ্লিকেট রিমুভ
             seen = set()
@@ -100,7 +97,7 @@ class GitHubAPIClient:
             logger.error(f"GitHub API error: {e}")
             return []
 
-    def _is_live_repo(self, repo: Dict) -> bool:
+    def _is_live(self, repo: Dict) -> bool:
         """লাইভ চেক"""
         try:
             # গত ২৪ ঘন্টায় আপডেট?
@@ -136,6 +133,7 @@ class GitHubBot:
         self.last_sent = set()
         self.updater = None
         self.bot = None
+        self.github = GitHubClient(GITHUB_TOKEN)
         self.is_running = True
 
     def start(self):
@@ -149,7 +147,6 @@ class GitHubBot:
             
             # হ্যান্ডলার যোগ
             dp.add_handler(CommandHandler("start", self.start_command))
-            dp.add_handler(CommandHandler("help", self.help_command))
             dp.add_handler(CallbackQueryHandler(self.button_callback))
             
             # এরর হ্যান্ডলার
@@ -161,12 +158,10 @@ class GitHubBot:
             # শিডিউলড টাস্ক
             threading.Thread(target=self.run_scheduler, daemon=True).start()
             
-            logger.info("Bot started successfully!")
+            logger.info("✅ Bot started successfully!")
             
             # পোলিং স্টার্ট
             self.updater.start_polling()
-            
-            # আইডল (বট চালু রাখতে)
             self.updater.idle()
             
         except Exception as e:
@@ -192,9 +187,9 @@ class GitHubBot:
         """শিডিউলার"""
         while self.is_running:
             try:
-                logger.info("Starting scheduled scrape...")
+                logger.info("🔄 Starting scheduled scrape...")
                 self.scrape_and_send()
-                logger.info("Scheduled scrape completed")
+                logger.info("✅ Scheduled scrape completed")
             except Exception as e:
                 logger.error(f"Scheduler error: {e}")
             time.sleep(3600)  # ১ ঘন্টা
@@ -202,11 +197,7 @@ class GitHubBot:
     def scrape_and_send(self):
         """স্ক্র্যাপ এবং সেন্ড"""
         try:
-            # সিঙ্ক্রোনাসভাবে রান
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            repos = loop.run_until_complete(self.get_live_repos())
-            loop.close()
+            repos = self.github.get_live_repos()
             
             if not repos:
                 return
@@ -232,15 +223,10 @@ class GitHubBot:
                 except Exception as e:
                     logger.error(f"Send error: {e}")
                     
-            logger.info(f"Sent {len(new_repos[:10])} new repos")
+            logger.info(f"✅ Sent {len(new_repos[:10])} new repos")
             
         except Exception as e:
             logger.error(f"Scrape and send error: {e}")
-
-    async def get_live_repos(self) -> List[Dict]:
-        """লাইভ রিপোজিটরি পাওয়ার জন্য async মেথড"""
-        client = GitHubAPIClient(GITHUB_TOKEN)
-        return await client.get_live_repos()
 
     def format_repo_message(self, repo: Dict) -> str:
         """মেসেজ ফরম্যাট"""
@@ -266,7 +252,7 @@ class GitHubBot:
 🔗 [View on GitHub]({url})
 """
 
-    def start_command(self, update: Update, context: CallbackContext):
+    def start_command(self, update: Update, context):
         """স্টার্ট কমান্ড"""
         if not update.effective_user:
             return
@@ -284,8 +270,6 @@ class GitHubBot:
 
         update.message.reply_text(
             "🚀 **GitHub লাইভ API স্ক্র্যাপার বট**\n\n"
-            "এই বট GitHub থেকে লাইভ রিপোজিটরি স্ক্র্যাপ করে এবং "
-            "আপনার প্রাইভেট গ্রুপে পাঠায়।\n\n"
             "🔹 স্বয়ংক্রিয়ভাবে প্রতি ১ ঘন্টায় স্ক্র্যাপ হয়\n"
             "🔹 শুধুমাত্র লাইভ এবং সক্রিয় রিপোজিটরি\n"
             "🔹 সম্পূর্ণ প্রাইভেট এবং সুরক্ষিত\n\n"
@@ -294,11 +278,7 @@ class GitHubBot:
             parse_mode='Markdown'
         )
 
-    def help_command(self, update: Update, context: CallbackContext):
-        """হেল্প কমান্ড"""
-        self.start_command(update, context)
-
-    def button_callback(self, update: Update, context: CallbackContext):
+    def button_callback(self, update: Update, context):
         """বাটন কলব্যাক"""
         if not update.effective_user or not update.callback_query:
             return
@@ -321,70 +301,60 @@ class GitHubBot:
         """লাইভ রিপোজিটরি দেখান"""
         query.edit_message_text("🔄 লাইভ রিপোজিটরি খোঁজা হচ্ছে...")
         
-        try:
-            # থ্রেডেডভাবে স্ক্র্যাপ
-            import threading
-            def scrape_and_reply():
-                try:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    repos = loop.run_until_complete(self.get_live_repos())
-                    loop.close()
-                    
-                    if not repos:
-                        self.bot.edit_message_text(
-                            chat_id=query.message.chat_id,
-                            message_id=query.message.message_id,
-                            text="❌ কোনো লাইভ রিপোজিটরি পাওয়া যায়নি!"
-                        )
-                        return
-                        
-                    new_repos = [r for r in repos if r.get('id') not in self.last_sent]
-                    
-                    if not new_repos:
-                        self.bot.edit_message_text(
-                            chat_id=query.message.chat_id,
-                            message_id=query.message.message_id,
-                            text="📭 কোনো নতুন লাইভ রিপোজিটরি পাওয়া যায়নি!"
-                        )
-                        return
-                        
-                    sent = 0
-                    for repo in new_repos[:10]:
-                        message = self.format_repo_message(repo)
-                        try:
-                            self.bot.send_message(
-                                chat_id=self.group_id,
-                                text=message,
-                                parse_mode='Markdown',
-                                disable_web_page_preview=True
-                            )
-                            self.last_sent.add(repo.get('id'))
-                            sent += 1
-                            time.sleep(0.3)
-                        except Exception as e:
-                            logger.error(f"Send error: {e}")
-                            
+        def scrape_and_reply():
+            try:
+                repos = self.github.get_live_repos()
+                
+                if not repos:
                     self.bot.edit_message_text(
                         chat_id=query.message.chat_id,
                         message_id=query.message.message_id,
-                        text=f"✅ {sent}টি নতুন লাইভ রিপোজিটরি পাঠানো হয়েছে!"
+                        text="❌ কোনো লাইভ রিপোজিটরি পাওয়া যায়নি!"
                     )
+                    return
                     
-                except Exception as e:
-                    logger.error(f"Scrape thread error: {e}")
+                new_repos = [r for r in repos if r.get('id') not in self.last_sent]
+                
+                if not new_repos:
                     self.bot.edit_message_text(
                         chat_id=query.message.chat_id,
                         message_id=query.message.message_id,
-                        text=f"❌ ত্রুটি: {str(e)}"
+                        text="📭 কোনো নতুন লাইভ রিপোজিটরি পাওয়া যায়নি!"
                     )
-            
-            thread = threading.Thread(target=scrape_and_reply, daemon=True)
-            thread.start()
-            
-        except Exception as e:
-            logger.error(f"View live error: {e}")
-            query.edit_message_text(f"❌ ত্রুটি: {str(e)}")
+                    return
+                    
+                sent = 0
+                for repo in new_repos[:10]:
+                    message = self.format_repo_message(repo)
+                    try:
+                        self.bot.send_message(
+                            chat_id=self.group_id,
+                            text=message,
+                            parse_mode='Markdown',
+                            disable_web_page_preview=True
+                        )
+                        self.last_sent.add(repo.get('id'))
+                        sent += 1
+                        time.sleep(0.3)
+                    except Exception as e:
+                        logger.error(f"Send error: {e}")
+                        
+                self.bot.edit_message_text(
+                    chat_id=query.message.chat_id,
+                    message_id=query.message.message_id,
+                    text=f"✅ {sent}টি নতুন লাইভ রিপোজিটরি পাঠানো হয়েছে!"
+                )
+                
+            except Exception as e:
+                logger.error(f"Scrape error: {e}")
+                self.bot.edit_message_text(
+                    chat_id=query.message.chat_id,
+                    message_id=query.message.message_id,
+                    text=f"❌ ত্রুটি: {str(e)}"
+                )
+        
+        thread = threading.Thread(target=scrape_and_reply, daemon=True)
+        thread.start()
 
     def manual_scrape(self, query):
         """ম্যানুয়াল স্ক্র্যাপ"""
@@ -406,7 +376,7 @@ class GitHubBot:
         """
         query.edit_message_text(stats, parse_mode='Markdown')
 
-    def error_handler(self, update: Update, context: CallbackContext):
+    def error_handler(self, update: Update, context):
         """এরর হ্যান্ডলার"""
         logger.error(f"Update {update} caused error {context.error}")
 
@@ -414,20 +384,14 @@ class GitHubBot:
 def main():
     """মেইন ফাংশন"""
     try:
-        # চেক ভেরিয়েবল
-        if not BOT_TOKEN:
-            raise ValueError("BOT_TOKEN missing")
-        if not PRIVATE_GROUP_ID:
-            raise ValueError("PRIVATE_GROUP_ID missing")
-        if not ADMIN_USER_ID:
-            raise ValueError("ADMIN_USER_ID missing")
-        if not GITHUB_TOKEN:
-            raise ValueError("GITHUB_TOKEN missing")
+        # ভেরিয়েবল চেক
+        if not all([BOT_TOKEN, PRIVATE_GROUP_ID, ADMIN_USER_ID, GITHUB_TOKEN]):
+            raise ValueError("Missing required environment variables")
 
         # ফ্লাস্ক থ্রেড
         flask_thread = threading.Thread(target=run_flask, daemon=True)
         flask_thread.start()
-        logger.info("Flask server started on port 8080")
+        logger.info("🌐 Flask server started on port 8080")
 
         # বট স্টার্ট
         bot = GitHubBot(BOT_TOKEN, PRIVATE_GROUP_ID, ADMIN_USER_ID)
@@ -438,5 +402,4 @@ def main():
         sys.exit(1)
 
 if __name__ == '__main__':
-    import time
     main()
