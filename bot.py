@@ -1,833 +1,366 @@
 import asyncio
-import html
 import logging
-from collections import Counter
-from datetime import datetime, timezone
+import os
+import re
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Set
 
-from aiohttp import web
-from aiogram import Bot, Dispatcher, Router
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
-from aiogram.filters import Command
-from aiogram.types import Message
+import aiohttp
+import requests
+from cachetools import TTLCache
+from dotenv import load_dotenv
+from flask import Flask
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-from config import (
-    BOT_TOKEN,
-    OWNER_ID,
-    TARGET_CHAT_ID,
-    GITHUB_TOKEN,
-    SCAN_INTERVAL,
-    SEARCH_LIMIT,
-    PORT,
-    validate_config,
-)
+# লোড এনভায়রনমেন্ট ভেরিয়েবল
+load_dotenv()
 
-from scanner import GitHubScanner
+# কনফিগারেশন
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+PRIVATE_GROUP_ID = int(os.getenv('PRIVATE_GROUP_ID'))
+ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID'))
+GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
 
-
-# =========================================================
-# LOGGING
-# =========================================================
-
+# লগিং সেটআপ
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
-
 logger = logging.getLogger(__name__)
 
-
-# =========================================================
-# TELEGRAM
-# =========================================================
-
-router = Router()
-
-scanner = GitHubScanner(GITHUB_TOKEN)
-
-scan_lock = asyncio.Lock()
-
-bot_paused = False
-
-seen = set()
-
-stats = {
-    "total_scans": 0,
-    "total_results": 0,
-    "new_results": 0,
-    "last_scan": None,
-    "last_error": None,
-}
-
-
-# =========================================================
-# SECURITY
-# =========================================================
-
-def owner_only(message: Message) -> bool:
-    return bool(
-        message.from_user
-        and message.from_user.id == OWNER_ID
-    )
-
-
-# =========================================================
-# SAFE HTML
-# =========================================================
-
-def esc(value) -> str:
-    return html.escape(str(value))
-
-
-# =========================================================
-# /START
-# =========================================================
-
-@router.message(Command("start"))
-async def start_handler(message: Message):
-
-    if not owner_only(message):
-        return
-
-    status = "⏸ Paused" if bot_paused else "🟢 Running"
-
-    await message.answer(
-        "<b>🔐 PRIVATE GITHUB MONITOR</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🤖 Status: {status}\n"
-        "👑 Access: Owner Only\n"
-        "🛡 Secret values: REDACTED\n"
-        "🧪 Live validation: Disabled\n\n"
-        "<b>Commands</b>\n"
-        "├ /scan — Run scan now\n"
-        "├ /status — Bot status\n"
-        "├ /stats — Scan statistics\n"
-        "├ /pause — Pause automatic scans\n"
-        "└ /resume — Resume automatic scans\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━"
-    )
-
-
-# =========================================================
-# /STATUS
-# =========================================================
-
-@router.message(Command("status"))
-async def status_handler(message: Message):
-
-    if not owner_only(message):
-        return
-
-    status = "⏸ Paused" if bot_paused else "🟢 Running"
-
-    last_scan = (
-        stats["last_scan"]
-        or "Never"
-    )
-
-    await message.answer(
-        "<b>📡 SYSTEM STATUS</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🤖 Bot: {status}\n"
-        "❤️ Health: OK\n"
-        f"⏱ Interval: {SCAN_INTERVAL}s\n"
-        f"🔎 Search limit: {SEARCH_LIMIT}\n"
-        f"📦 Seen: {len(seen)}\n"
-        f"🔄 Last scan: {esc(last_scan)}\n\n"
-        "🔐 Secret values: REDACTED\n"
-        "🧪 Live validation: Disabled\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━"
-    )
-
-
-# =========================================================
-# /STATS
-# =========================================================
-
-@router.message(Command("stats"))
-async def stats_handler(message: Message):
-
-    if not owner_only(message):
-        return
-
-    await message.answer(
-        "<b>📊 SCANNER STATISTICS</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🔄 Total scans: {stats['total_scans']}\n"
-        f"📦 Total results: {stats['total_results']}\n"
-        f"🆕 New results: {stats['new_results']}\n"
-        f"🗂 Tracked findings: {len(seen)}\n\n"
-        f"🕐 Last scan:\n"
-        f"{esc(stats['last_scan'] or 'Never')}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━"
-    )
-
-
-# =========================================================
-# /PAUSE
-# =========================================================
-
-@router.message(Command("pause"))
-async def pause_handler(message: Message):
-
-    global bot_paused
-
-    if not owner_only(message):
-        return
-
-    bot_paused = True
-
-    await message.answer(
-        "⏸ <b>Automatic scanning paused.</b>\n\n"
-        "Use /resume to continue."
-    )
-
-
-# =========================================================
-# /RESUME
-# =========================================================
-
-@router.message(Command("resume"))
-async def resume_handler(message: Message):
-
-    global bot_paused
-
-    if not owner_only(message):
-        return
-
-    bot_paused = False
-
-    await message.answer(
-        "▶️ <b>Automatic scanning resumed.</b>"
-    )
-
-
-# =========================================================
-# SCAN
-# =========================================================
-
-async def run_scan():
-
-    global stats
-
-    if scan_lock.locked():
-        logger.warning(
-            "Scan already running."
-        )
-        return []
-
-    async with scan_lock:
-
-        logger.info(
-            "Starting GitHub scan..."
-        )
-
-        queries = [
-            {
-                "provider": "xAI",
-                "query": '"xai-"',
-            },
-            {
-                "provider": "Groq",
-                "query": '"gsk_"',
-            },
-            {
-                "provider": "Anthropic",
-                "query": '"sk-ant-"',
-            },
-            {
-                "provider": "Google",
-                "query": '"AIza"',
-            },
-            {
-                "provider": "OpenAI",
-                "query": '"sk-"',
-            },
-            {
-                "provider": "GitHub",
-                "query": '"ghp_"',
-            },
-        ]
-
-        results = await scanner.scan_queries(
-            queries,
-            SEARCH_LIMIT,
-        )
-
-        stats["total_scans"] += 1
-        stats["total_results"] += len(results)
-
-        new_results = []
-
-        for result in results:
-
-            unique_id = (
-                f"{result['provider']}|"
-                f"{result['repository']}|"
-                f"{result['path']}|"
-                f"{result.get('fingerprint', '')}"
-            )
-
-            if unique_id in seen:
-                continue
-
-            seen.add(unique_id)
-
-            new_results.append(
-                result
-            )
-
-        stats["new_results"] += len(
-            new_results
-        )
-
-        stats["last_scan"] = (
-            datetime.now(timezone.utc)
-            .strftime("%Y-%m-%d %H:%M:%S UTC")
-        )
-
-        logger.info(
-            "Scan complete. Results=%d New=%d",
-            len(results),
-            len(new_results),
-        )
-
-        return new_results
-
-
-# =========================================================
-# FORMAT FINDING
-# =========================================================
-
-def format_finding(finding) -> str:
-
-    provider = esc(
-        finding.get(
-            "provider",
-            "Unknown"
-        )
-    )
-
-    repository = esc(
-        finding.get(
-            "repository",
-            "unknown"
-        )
-    )
-
-    path = esc(
-        finding.get(
-            "path",
-            "unknown"
-        )
-    )
-
-    url = finding.get(
-        "url",
-        ""
-    )
-
-    fingerprint = esc(
-        finding.get(
-            "fingerprint",
-            "N/A"
-        )
-    )
-
-    return (
-        "🚨 <b>POTENTIAL CREDENTIAL EXPOSURE</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-
-        f"🏷 <b>Provider:</b> "
-        f"<code>{provider}</code>\n"
-
-        "🔑 <b>Type:</b> "
-        "<code>API credential</code>\n"
-
-        "📊 <b>Status:</b> "
-        "<code>DETECTED</code>\n"
-
-        "🧪 <b>Validation:</b> "
-        "<code>NOT PERFORMED</code>\n\n"
-
-        f"📦 <b>Repository:</b>\n"
-        f"<code>{repository}</code>\n\n"
-
-        f"📄 <b>File:</b>\n"
-        f"<code>{path}</code>\n\n"
-
-        f"🆔 <b>Fingerprint:</b>\n"
-        f"<code>{fingerprint}</code>\n\n"
-
-        f"🔗 <a href=\"{esc(url)}\">"
-        f"Open source on GitHub</a>\n\n"
-
-        "🔒 <b>Secret:</b> "
-        "<code>REDACTED</code>\n"
-
-        "⚠️ Credential value is intentionally hidden.\n"
-        "━━━━━━━━━━━━━━━━━━━━━━"
-    )
-
-
-# =========================================================
-# SUMMARY
-# =========================================================
-
-def format_summary(findings) -> str:
-
-    providers = Counter(
-        item.get(
-            "provider",
-            "Unknown"
-        )
-        for item in findings
-    )
-
-    lines = [
-        "<b>📊 GITHUB SECURITY SCAN</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        "",
-        f"🆕 <b>New findings:</b> {len(findings)}",
-        "",
-        "<b>🏷 Providers detected</b>",
-    ]
-
-    for provider, count in providers.most_common():
-
-        lines.append(
-            f"├ {esc(provider)}: "
-            f"<b>{count}</b>"
-        )
-
-    lines.extend([
-        "",
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        "🔐 Secret values: REDACTED",
-        "🧪 Live validation: Disabled",
-        "🛡 Duplicate filtering: Enabled",
-        "━━━━━━━━━━━━━━━━━━━━━━",
-    ])
-
-    return "\n".join(lines)
-
-
-# =========================================================
-# TELEGRAM SAFE SEND
-# =========================================================
-
-async def safe_send(
-    bot: Bot,
-    text: str,
-):
-
-    max_attempts = 5
-
-    for attempt in range(
-        max_attempts
-    ):
-
+# ক্যাশে সেটআপ (5 মিনিটের জন্য ক্যাশে)
+cache = TTLCache(maxsize=1000, ttl=300)
+
+# ফ্লাস্ক অ্যাপ (হেলথ চেকের জন্য)
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def health_check():
+    return "True", 200
+
+@flask_app.route('/health')
+def health():
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}, 200
+
+# GitHub API ক্লায়েন্ট
+class GitHubAPIClient:
+    def __init__(self, token: str):
+        self.token = token
+        self.headers = {
+            'Authorization': f'token {token}',
+            'Accept': 'application/vnd.github.v3+json'
+        }
+        self.base_url = 'https://api.github.com'
+        self.session = None
+
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession(headers=self.headers)
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+
+    async def get_live_repos(self) -> List[Dict]:
+        """সকল লাইভ রিপোজিটরি খুঁজে বের করে"""
+        live_repos = []
         try:
+            # জনপ্রিয় রিপোজিটরি থেকে স্ক্র্যাপ
+            urls = [
+                f'{self.base_url}/search/repositories?q=stars:>1&sort=updated&order=desc&per_page=100',
+                f'{self.base_url}/search/repositories?q=pushed:>{datetime.now() - timedelta(days=1)}&sort=updated&order=desc&per_page=100',
+                f'{self.base_url}/search/repositories?q=language:python&sort=updated&order=desc&per_page=50',
+                f'{self.base_url}/search/repositories?q=language:javascript&sort=updated&order=desc&per_page=50',
+            ]
 
-            await bot.send_message(
-                chat_id=TARGET_CHAT_ID,
-                text=text,
-                disable_web_page_preview=True,
-            )
+            for url in urls:
+                async with self.session.get(url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        repos = data.get('items', [])
+                        for repo in repos:
+                            # লাইভ চেক
+                            if self._is_live_repo(repo):
+                                live_repos.append(repo)
+                    await asyncio.sleep(0.5)  # Rate limit এড়াতে
 
-            # Small controlled delay.
-            await asyncio.sleep(1.5)
+            # ডুপ্লিকেট রিমুভ
+            seen = set()
+            unique_repos = []
+            for repo in live_repos:
+                repo_id = repo['id']
+                if repo_id not in seen:
+                    seen.add(repo_id)
+                    unique_repos.append(repo)
 
-            return True
+            return unique_repos[:50]  # সর্বোচ্চ 50টি
 
-        except TelegramRetryAfter as error:
+        except Exception as e:
+            logger.error(f"GitHub API error: {e}")
+            return []
 
-            retry_after = int(
-                error.retry_after
-            ) + 2
+    def _is_live_repo(self, repo: Dict) -> bool:
+        """রিপোজিটরি লাইভ কিনা চেক করে"""
+        try:
+            # গত 24 ঘন্টায় আপডেট হয়েছে?
+            updated_at = datetime.fromisoformat(repo['updated_at'].replace('Z', '+00:00'))
+            if datetime.now().astimezone() - updated_at < timedelta(hours=24):
+                return True
 
-            logger.warning(
-                "Telegram flood control. "
-                "Sleeping %s seconds.",
-                retry_after,
-            )
+            # অনেক স্টার বা ফর্ক আছে?
+            if repo.get('stargazers_count', 0) > 1000:
+                return True
 
-            await asyncio.sleep(
-                retry_after
-            )
+            # অনেক ওপেন ইস্যু/পিআর আছে?
+            if repo.get('open_issues_count', 0) > 50:
+                return True
 
-        except TelegramBadRequest as error:
-
-            logger.error(
-                "Telegram BadRequest: %s",
-                error,
-            )
+            # সাম্প্রতিক পুশ হয়েছে?
+            if repo.get('pushed_at'):
+                pushed_at = datetime.fromisoformat(repo['pushed_at'].replace('Z', '+00:00'))
+                if datetime.now().astimezone() - pushed_at < timedelta(hours=12):
+                    return True
 
             return False
 
-        except Exception:
+        except Exception as e:
+            logger.error(f"Error checking live status: {e}")
+            return False
 
-            logger.exception(
-                "Telegram send failed."
-            )
+    async def get_repo_activities(self, repo_name: str) -> List[Dict]:
+        """রিপোজিটরির সাম্প্রতিক অ্যাক্টিভিটি পায়"""
+        try:
+            url = f'{self.base_url}/repos/{repo_name}/events'
+            async with self.session.get(url, params={'per_page': 10}) as response:
+                if response.status == 200:
+                    return await response.json()
+                return []
+        except Exception as e:
+            logger.error(f"Error fetching activities: {e}")
+            return []
 
-            await asyncio.sleep(
-                3
-            )
+# টেলিগ্রাম বট হ্যান্ডলার
+class TelegramBot:
+    def __init__(self, token: str, group_id: int, admin_id: int):
+        self.token = token
+        self.group_id = group_id
+        self.admin_id = admin_id
+        self.last_sent_repos: Set[int] = set()
+        self.application = None
+        self.github_client = GitHubAPIClient(GITHUB_TOKEN)
 
-    return False
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/start কমান্ড হ্যান্ডলার"""
+        if update.effective_user.id != self.admin_id:
+            await update.message.reply_text("⛔ আপনি এই বট ব্যবহার করার অনুমতি পাবেন না!")
+            return
 
-
-# =========================================================
-# SEND FINDINGS
-# =========================================================
-
-async def send_findings(
-    bot: Bot,
-    findings,
-):
-
-    if not findings:
-        return
-
-    # First send one summary.
-    await safe_send(
-        bot,
-        format_summary(findings),
-    )
-
-    # Maximum findings per Telegram message.
-    batch_size = 5
-
-    for index in range(
-        0,
-        len(findings),
-        batch_size,
-    ):
-
-        batch = findings[
-            index:index + batch_size
+        keyboard = [
+            [InlineKeyboardButton("📊 লাইভ রিপোজিটরি দেখুন", callback_data='view_live')],
+            [InlineKeyboardButton("🔄 ম্যানুয়াল স্ক্র্যাপ", callback_data='manual_scrape')],
+            [InlineKeyboardButton("📈 পরিসংখ্যান", callback_data='stats')],
         ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
 
-        blocks = []
-
-        for number, finding in enumerate(
-            batch,
-            start=index + 1,
-        ):
-
-            provider = esc(
-                finding.get(
-                    "provider",
-                    "Unknown"
-                )
-            )
-
-            repository = esc(
-                finding.get(
-                    "repository",
-                    "unknown"
-                )
-            )
-
-            path = esc(
-                finding.get(
-                    "path",
-                    "unknown"
-                )
-            )
-
-            url = finding.get(
-                "url",
-                ""
-            )
-
-            fingerprint = esc(
-                finding.get(
-                    "fingerprint",
-                    "N/A"
-                )
-            )
-
-            block = (
-                f"<b>#{number} • "
-                f"{provider}</b>\n"
-                f"📦 <code>{repository}</code>\n"
-                f"📄 <code>{path}</code>\n"
-                f"🆔 <code>{fingerprint}</code>\n"
-                f"🔗 <a href=\"{esc(url)}\">"
-                f"Source</a>\n"
-                "🔒 Secret: <code>REDACTED</code>"
-            )
-
-            blocks.append(block)
-
-        text = (
-            "<b>🔎 FINDINGS</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            + "\n\n".join(blocks)
-            + "\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━"
+        await update.message.reply_text(
+            "🚀 **GitHub লাইভ API স্ক্র্যাপার বট**\n\n"
+            "এই বট GitHub থেকে লাইভ রিপোজিটরি স্ক্র্যাপ করে এবং "
+            "আপনার প্রাইভেট গ্রুপে পাঠায়।\n\n"
+            "🔹 স্বয়ংক্রিয়ভাবে প্রতি ১ ঘন্টায় স্ক্র্যাপ হয়\n"
+            "🔹 শুধুমাত্র লাইভ এবং সক্রিয় রিপোজিটরি\n"
+            "🔹 সম্পূর্ণ প্রাইভেট এবং সুরক্ষিত\n\n"
+            "নিচের বাটন ব্যবহার করে নিয়ন্ত্রণ করুন:",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
         )
 
-        await safe_send(
-            bot,
-            text,
-        )
+    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """বাটন কলব্যাক হ্যান্ডলার"""
+        query = update.callback_query
+        await query.answer()
 
+        if update.effective_user.id != self.admin_id:
+            await query.edit_message_text("⛔ আপনি এই অপারেশন করতে পারবেন না!")
+            return
 
-# =========================================================
-# MANUAL SCAN
-# =========================================================
+        if query.data == 'view_live':
+            await self.send_live_repos(update)
+        elif query.data == 'manual_scrape':
+            await self.manual_scrape(update)
+        elif query.data == 'stats':
+            await self.show_stats(update)
 
-@router.message(Command("scan"))
-async def scan_handler(message: Message):
-
-    if not owner_only(message):
-        return
-
-    if scan_lock.locked():
-
-        await message.answer(
-            "⏳ <b>Scan already running.</b>\n\n"
-            "Please wait."
-        )
-
-        return
-
-    await message.answer(
-        "🔎 <b>Starting GitHub scan...</b>\n\n"
-        "Please wait."
-    )
-
-    try:
-
-        findings = await run_scan()
-
-        if findings:
-
-            await send_findings(
-                message.bot,
-                findings,
-            )
-
-            await message.answer(
-                "✅ <b>Scan completed.</b>\n\n"
-                f"🆕 New findings: "
-                f"<b>{len(findings)}</b>"
-            )
-
-        else:
-
-            await message.answer(
-                "✅ <b>Scan completed.</b>\n\n"
-                "🟢 No new findings."
-            )
-
-    except Exception:
-
-        logger.exception(
-            "Manual scan failed."
-        )
-
-        await message.answer(
-            "❌ <b>Scan failed.</b>\n\n"
-            "Check Render logs."
-        )
-
-
-# =========================================================
-# BACKGROUND SCANNER
-# =========================================================
-
-async def scanner_loop(bot: Bot):
-
-    await asyncio.sleep(15)
-
-    while True:
-
+    async def send_live_repos(self, update: Update = None):
+        """লাইভ রিপোজিটরি গ্রুপে পাঠায়"""
         try:
+            async with self.github_client as client:
+                repos = await client.get_live_repos()
 
-            if bot_paused:
+                if not repos:
+                    msg = "❌ কোনো লাইভ রিপোজিটরি পাওয়া যায়নি!"
+                    if update:
+                        await update.callback_query.edit_message_text(msg)
+                    else:
+                        await self.send_message_to_group(msg)
+                    return
 
-                logger.info(
-                    "Scanner paused."
-                )
+                # ডুপ্লিকেট চেক
+                new_repos = [r for r in repos if r['id'] not in self.last_sent_repos]
 
-            else:
+                if not new_repos:
+                    msg = "📭 কোনো নতুন লাইভ রিপোজিটরি পাওয়া যায়নি!"
+                    if update:
+                        await update.callback_query.edit_message_text(msg)
+                    else:
+                        await self.send_message_to_group(msg)
+                    return
 
-                findings = await run_scan()
+                # প্রতিটি রিপোজিটরি আলাদা মেসেজ হিসেবে পাঠাই
+                for repo in new_repos[:10]:  # প্রতি বার ১০টি
+                    message = self._format_repo_message(repo)
+                    await self.send_message_to_group(message)
+                    self.last_sent_repos.add(repo['id'])
+                    await asyncio.sleep(0.5)  # রেট লিমিট এড়াতে
 
-                if findings:
+                # ক্যাশে ক্লিয়ার
+                if len(self.last_sent_repos) > 1000:
+                    self.last_sent_repos.clear()
 
-                    await send_findings(
-                        bot,
-                        findings,
-                    )
-
+                summary = f"✅ {len(new_repos[:10])}টি নতুন লাইভ রিপোজিটরি পাঠানো হয়েছে!"
+                if update:
+                    await update.callback_query.edit_message_text(summary)
                 else:
+                    await self.send_message_to_group(summary)
 
-                    logger.info(
-                        "No new findings."
-                    )
+        except Exception as e:
+            logger.error(f"Error sending live repos: {e}")
+            error_msg = f"❌ ত্রুটি: {str(e)}"
+            if update:
+                await update.callback_query.edit_message_text(error_msg)
+            else:
+                await self.send_message_to_group(error_msg)
 
-        except asyncio.CancelledError:
+    async def manual_scrape(self, update: Update):
+        """ম্যানুয়াল স্ক্র্যাপ"""
+        await update.callback_query.edit_message_text("🔄 স্ক্র্যাপিং শুরু হচ্ছে...")
+        await self.send_live_repos(update)
 
-            logger.info(
-                "Scanner task cancelled."
-            )
+    async def show_stats(self, update: Update):
+        """পরিসংখ্যান দেখায়"""
+        stats = f"""
+📊 **বট পরিসংখ্যান**
 
-            raise
+🤖 বট স্ট্যাটাস: ✅ চালু
+📁 মোট ক্যাশেড রিপো: {len(cache)}
+🔄 শেষ স্ক্র্যাপ: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+👑 অ্যাডমিন: {self.admin_id}
 
-        except Exception as error:
+🔹 প্রতি ১ ঘন্টায় স্বয়ংক্রিয় স্ক্র্যাপ
+🔹 সর্বোচ্চ ৫০টি রিপোজিটরি প্রতি বার
+🔹 শুধুমাত্র লাইভ রিপোজিটরি পাঠানো হয়
+        """
+        await update.callback_query.edit_message_text(stats, parse_mode='Markdown')
 
-            stats["last_error"] = str(
-                error
-            )
+    def _format_repo_message(self, repo: Dict) -> str:
+        """রিপোজিটরি ফরম্যাট করে"""
+        name = repo.get('full_name', 'N/A')
+        description = repo.get('description', 'No description') or 'No description'
+        stars = repo.get('stargazers_count', 0)
+        forks = repo.get('forks_count', 0)
+        language = repo.get('language', 'Unknown')
+        url = repo.get('html_url', '#')
+        updated_at = repo.get('updated_at', 'N/A')
+        open_issues = repo.get('open_issues_count', 0)
 
-            logger.exception(
-                "Scanner cycle failed."
-            )
+        return f"""
+🚀 **{name}**
 
-        await asyncio.sleep(
-            SCAN_INTERVAL
-        )
+📝 {description[:200]}...
 
+⭐ {stars} Stars | 🍴 {forks} Forks
+💻 Language: {language}
+🐛 Open Issues: {open_issues}
+🔄 Updated: {updated_at[:10]}
 
-# =========================================================
-# HEALTH
-# =========================================================
+🔗 [View on GitHub]({url})
+"""
 
-async def health(request):
-
-    return web.json_response(
-        {
-            "status": "ok",
-            "service": "github-secret-monitor",
-            "bot": "running",
-            "scanner": (
-                "paused"
-                if bot_paused
-                else "running"
-            ),
-        }
-    )
-
-
-# =========================================================
-# HEALTH SERVER
-# =========================================================
-
-async def start_health_server():
-
-    app = web.Application()
-
-    app.router.add_get(
-        "/",
-        health,
-    )
-
-    app.router.add_get(
-        "/health",
-        health,
-    )
-
-    runner = web.AppRunner(
-        app
-    )
-
-    await runner.setup()
-
-    site = web.TCPSite(
-        runner,
-        "0.0.0.0",
-        PORT,
-    )
-
-    await site.start()
-
-    logger.info(
-        "Health server running on port %s",
-        PORT,
-    )
-
-    return runner
-
-
-# =========================================================
-# MAIN
-# =========================================================
-
-async def main():
-
-    validate_config()
-
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(
-            parse_mode=ParseMode.HTML
-        ),
-    )
-
-    dp = Dispatcher()
-
-    dp.include_router(
-        router
-    )
-
-    health_runner = (
-        await start_health_server()
-    )
-
-    scanner_task = asyncio.create_task(
-        scanner_loop(bot)
-    )
-
-    logger.info(
-        "Telegram bot started."
-    )
-
-    try:
-
-        await dp.start_polling(
-            bot,
-            allowed_updates=(
-                dp.resolve_used_update_types()
-            ),
-        )
-
-    finally:
-
-        scanner_task.cancel()
-
+    async def send_message_to_group(self, message: str):
+        """গ্রুপে মেসেজ পাঠায়"""
         try:
+            await self.application.bot.send_message(
+                chat_id=self.group_id,
+                text=message,
+                parse_mode='Markdown',
+                disable_web_page_preview=True
+            )
+        except Exception as e:
+            logger.error(f"Error sending message to group: {e}")
 
-            await scanner_task
+    async def scheduled_scrape(self):
+        """শিডিউল্ড স্ক্র্যাপ - প্রতি ১ ঘন্টায়"""
+        while True:
+            try:
+                logger.info("Starting scheduled scrape...")
+                await self.send_live_repos()
+                logger.info("Scheduled scrape completed successfully")
+            except Exception as e:
+                logger.error(f"Error in scheduled scrape: {e}")
+            await asyncio.sleep(3600)  # ১ ঘন্টা
 
-        except asyncio.CancelledError:
+    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """এরর হ্যান্ডলার"""
+        logger.error(f"Update {update} caused error {context.error}")
+        if update and update.effective_user.id == self.admin_id:
+            await update.message.reply_text(f"❌ ত্রুটি: {str(context.error)}")
 
-            pass
+    def run(self):
+        """বট রান করে"""
+        # অ্যাপ্লিকেশন তৈরি
+        self.application = Application.builder().token(self.token).build()
 
-        await health_runner.cleanup()
+        # হ্যান্ডলার যোগ
+        self.application.add_handler(CommandHandler("start", self.start_command))
+        self.application.add_handler(CommandHandler("help", self.start_command))
+        self.application.add_handler(CallbackQueryHandler(self.button_callback))
 
-        await bot.session.close()
+        # এরর হ্যান্ডলার
+        self.application.add_error_handler(self.error_handler)
 
+        # স্টার্টআপ মেসেজ
+        asyncio.create_task(self.send_startup_message())
 
-# =========================================================
-# ENTRY POINT
-# =========================================================
+        # শিডিউলড টাস্ক শুরু
+        asyncio.create_task(self.scheduled_scrape())
 
-if __name__ == "__main__":
+        # বট রান
+        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    try:
-
-        asyncio.run(
-            main()
+    async def send_startup_message(self):
+        """স্টার্টআপে গ্রুপে মেসেজ পাঠায়"""
+        await asyncio.sleep(5)  # বট স্টার্ট হতে সময় দেয়
+        await self.send_message_to_group(
+            "🚀 **GitHub লাইভ API স্ক্র্যাপার বট চালু হয়েছে!**\n\n"
+            "🔹 প্রতি ১ ঘন্টায় স্বয়ংক্রিয়ভাবে স্ক্র্যাপ হবে\n"
+            "🔹 লাইভ রিপোজিটরি এই গ্রুপে পাঠানো হবে\n"
+            "🔹 /start কমান্ড দিয়ে কন্ট্রোল প্যানেল দেখুন"
         )
 
-    except KeyboardInterrupt:
+# মেইন ফাংশন
+async def main():
+    """মেইন ফাংশন"""
+    # ফ্লাস্ক অ্যাপ চালু (হেলথ চেকের জন্য)
+    import threading
+    def run_flask():
+        flask_app.run(host='0.0.0.0', port=8080, debug=False)
 
-        logger.info(
-            "Bot stopped."
-        )
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    # বট চালু
+    bot = TelegramBot(BOT_TOKEN, PRIVATE_GROUP_ID, ADMIN_USER_ID)
+    bot.run()
+
+if __name__ == '__main__':
+    asyncio.run(main())
