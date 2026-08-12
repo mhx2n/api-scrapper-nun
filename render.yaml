@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: github-secret-monitor
+    runtime: python
+    plan: free
+
+    buildCommand: pip install -r requirements.txt
+
+    startCommand: python bot.py
+
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+
+      - key: OWNER_ID
+        sync: false
+
+      - key: TARGET_CHAT_ID
+        sync: false
+
+      - key: GITHUB_TOKEN
+        sync: false
+
+      - key: SCAN_INTERVAL
+        value: "900"
+
+      - key: SEARCH_LIMIT
+        value: "30"
