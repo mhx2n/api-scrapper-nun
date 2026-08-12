@@ -26,3 +26,6 @@ services:
 
       - key: SEARCH_LIMIT
         value: "30"
+
+      - key: PORT
+        value: "10000"
